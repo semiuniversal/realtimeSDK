@@ -58,6 +58,7 @@ Preferred (activation-free) workflow using uv:
 
 - macOS/Linux:
   ```bash
+  chmod +x setup.sh
   bash setup.sh
   uv run airbrush tui-textual
   ```
