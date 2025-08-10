@@ -1,0 +1,50 @@
+{
+  "connection": {
+    "transport_type": "serial",
+    "serial_port": "/dev/ttyACM0",
+    "serial_baudrate": 115200,
+    "http_host": "duet3.local",
+    "timeout": 5.0
+  },
+  "machine": {
+    "name": "H.Airbrush",
+    "safe_z_height": 5.0,
+    "spray_z_height": 1.5,
+    "tool_offsets": [
+      {"X": 0, "Y": 0, "Z": 0},
+      {"X": 100, "Y": -25, "Z": 0}
+    ],
+    "motion_limits": {
+      "X": [0, 695],
+      "Y": [0, 1080],
+      "Z": [0, 84],
+      "U": [0, 4],
+      "V": [0, 4]
+    }
+  },
+  "air_control": {
+    "tool_0_fan_index": 2,
+    "tool_1_fan_index": 3,
+    "on_value": 1.0,
+    "off_value": 0.0,
+    "stabilization_delay_ms": 50
+  },
+  "paint_flow": {
+    "default_width": 1.0,
+    "default_opacity": 1.0,
+    "flow_feedrate": 300,
+    "tool_0_axis": "U",
+    "tool_1_axis": "V"
+  },
+  "motion": {
+    "safe_travel_feedrate": 3000,
+    "spray_feedrate": 1500,
+    "z_safe_feedrate": 1000,
+    "z_spray_feedrate": 500
+  },
+  "cli": {
+    "history_file": ".airbrush_history",
+    "prompt": "airbrush> ",
+    "show_status_bar": true
+  }
+} 

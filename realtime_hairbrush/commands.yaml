@@ -1,0 +1,293 @@
+commands:
+  air:
+    purpose: Controls air flow
+    category: Tool Control
+    params:
+      state:
+        purpose: Specify air flow state. Only one air channel can be on at a time. Turning one on will turn the other off.
+        optional: true
+        accepts:
+          - on (default)
+          - 1
+          - true
+          - yes
+          - off
+          - 0
+          - false
+          - no
+      tool:
+        purpose: Select tool head to affect.
+        optional: true
+        accepts:
+          - 0 (default)
+          - a
+          - black
+          - 1
+          - b
+          - white
+    usage-examples:
+      - air // turn on tool 0 air
+      - air off // turn off all air
+      - air b // turn tool 0 air on
+      - air white on // turn tool air on
+
+  connect:
+    purpose: Open a session with Duet board.
+    category: Connection
+    params:
+      transport:
+        purpose: Connection transport type.
+        optional: true
+        accepts:
+          - http (default if last == "")
+          - serial
+          - last (default if last !== "")
+      port:
+        purpose: Select serial port. Stores last port connected in settings.yaml file.
+        optional: true
+        accepts:
+          - auto (default if last == "")
+          - "<port name>"
+          - last (default if last !== "")
+      baud:
+        purpose: Specify baud rate for serial port. Ignored if transport !== "serial". Stores last baud connected in settings.yaml file.
+        optional: true
+        accepts:
+          - auto (default if last == "")
+          - 115200
+          - 57600
+          - 38400
+          - 28800
+          - 19200
+          - 14400
+          - 9600    
+          - last (default if last !== "")
+      ip:
+        purpose: Specify IP address. Ignored if transport !== "http". Stores last IP connected in settings.yaml file.
+        optional: true
+        accepts:
+          - "<valid IP>"
+          - last (default if last !== "")
+    usage-examples:
+      - connect last // connects using last transport with optional ip, port and baud
+      - connect 192.168.86.27 // connects via http to IP
+      - connect http last // connects via http to last working IP
+      - connect com9 // connects to serial port using auto-baud (try to connect with highest baud first)
+      - connect serial // scans ports (port = auto) and finds open port, connects with highest baud. 
+      - connect serial last // open serial port with last working settings
+
+  disconnect:
+    purpose: Closes connection with Duet.
+    category: Connection
+
+  draw:
+    purpose: Draw a line segment with the selected tool. Wait until each move is complete before issuing freeing the terminal or chaining the next command.
+    category: Drawing
+    params:
+      tool:
+        purpose: Tool for drawing. Move tool into position first as fast as possible.
+        optional: true
+        accepts:
+          - keep (default, does not change tool)
+          - 0
+          - a
+          - black
+          - 1
+          - b
+          - white
+      p:
+        purpose: Paint flow as a floating point number 0-1.
+        optional: false
+        accepts:
+          - "<number, 0.0-1.0>"
+      f:
+        purpose: Feed rate for X/Y moves ONLY. Millimeters per second (calculated).
+        optional: true
+        accepts:
+          - max (default, fast as possible)
+          - "<number>"
+      xs:
+        purpose: Starting X position.
+        optional: true
+        accepts:
+          - keep (default, does not move before starting drawing)
+          - "<number>"
+      ys:
+        purpose: Starting Y position.
+        optional: true
+        accepts:
+          - keep (default, does not move before starting drawing)
+          - "<number>"
+      zs:
+        purpose: Starting Z position.
+        optional: true
+        accepts:
+          - keep (default, does not move before starting drawing)
+          - "<number>"
+      xe:
+        purpose: Ending X position.
+        optional: false
+        accepts:
+          - "<number>"
+      ye:
+        purpose: Ending Y position.
+        optional: false
+        accepts:
+          - "<number>"
+      ze:
+        purpose: Ending Z position.
+        optional: true
+        accepts:
+          - keep (default, does not move during drawing)
+          - "<number>"
+      ps:
+        purpose: Ending paint flow as a floating point number 0-1.
+        optional: true
+        description: If omitted use p value
+        accepts:
+          - "<number, 0.0-1.0>"
+    usage-examples:
+      - draw xe 75 ye 122 p 0.2 // Draws a line from current position X/Y/Z using current tool to X 75 mm and Y 122 mm keeping the current tool with a constant paint flow of 20% as fast as possible.
+      - draw xe75 ye122 p.2 // Draws a line from current position X/Y/Z using current tool to X 75 mm and Y 122 mm keeping the current tool with a constant paint flow of 20% as fast as possible.
+      - draw tool white f10 p.5 xs100 ys100 zs60 xe200 ye100 ze10 pe1 // (assuming tool 0 is selected) Swaps to tool 1 including offsets, rapid move to X 100mm, y 100 mm, z 60 mm. Turns on tool 1 air, immediately sets paint flow to tool 1 to 50% and starts moving simultaneous axes X/Y/Z to X 200 mm (Y does not move), Z 10 mm, and paint flow (V axis) to 100%. Stops paint flow and shuts off all airflow.
+
+  ip:
+    purpose: Auto-connect to serial and query the board's IP address.
+    category: Connection
+
+  exit:
+    purpose: Exit the interactive shell.
+    category: System
+    aliases:
+      - quit
+
+  quit:
+    purpose: Exit the interactive shell.
+    category: System
+    aliases:
+      - exit
+
+  dot:
+    purpose: Draw a spot with the selected tool.
+    category: Drawing
+    params:
+      tool:
+        purpose: Tool for drawing. Move tool into position first as fast as possible.
+        optional: true
+        accepts:
+          - keep (default, does not change tool)
+          - 0
+          - a
+          - black
+          - 1
+          - b
+          - white
+      p:
+        purpose: Paint flow as a floating point number 0-1.
+        optional: false
+        accepts:
+          - "<number, 0.0-1.0>"
+      x:
+        purpose: X position.
+        optional: false
+        accepts:
+          - "<number>"
+      y:
+        purpose: Y position.
+        optional: false
+        accepts:
+          - "<number>"
+      z:
+        purpose: Z position.
+        optional: false
+        accepts:
+          - "<number>"
+      ms:
+        purpose: Dwell while spraying for milliseconds.
+        optional: false
+        accepts:
+          - "<integer>"
+    usage-examples:
+      - dot tool white p.5 x100 y100 z60 ms100 // (assuming tool 0 is selected) Swaps to tool 1 including offsets, rapid move to X 100mm, y 100 mm, z 60 mm. Turns on tool 1 air, immediately sets paint flow to tool 1 to 50% dwells for 100ms. Stops paint flow and shuts off all airflow.
+
+  home:
+    purpose: Home axes.
+    category: Movement
+    params:
+      axes:
+        purpose: Specify axes to home.
+        optional: true
+        accepts:
+          - all (default)
+          - z
+    usage-examples:
+      - home // Homes all axes (G28) in sequence according to homeall.g
+      - home z // Homes just the Z axis (this is allowed)
+
+  gcode:
+    purpose: Send raw G-code. Single command or sequence.
+    category: Advanced
+    params:
+      command:
+        purpose: Valid gcode. Can be a sequence delimited with spaces, commas. Use with caution.
+        optional: false
+
+  help:
+    purpose: Show help for available commands.
+    category: System
+    params:
+      command:
+        purpose: Get help on one command.
+        optional: true
+        accepts:
+          - "<command string>"
+
+  move:
+    purpose: Move the tool head to an X/Y/Z position. Constrained by machine limits.
+    category: Movement
+    params:
+      x:
+        purpose: X component, float or integer.
+        optional: true
+        accepts:
+          - "<number>"
+          - max
+      y:
+        purpose: Y component, float or integer.
+        optional: true
+        accepts:
+          - "<number>"
+          - max
+      z:
+        purpose: Z component, float or integer.
+        optional: true
+        accepts:
+          - "<number>"
+          - max
+      f:
+        purpose: Specify speed for move. Millimeters per second (calculated).
+        optional: true
+        accepts:
+          - max (default, max feed rate specified in config.g)
+          - "<number>"
+    usage-examples:
+      - move z 10 // Move axis z to 10 mm above paper as fast as possible.
+      - move z10 // Move axis z to 10 mm above paper as fast as possible.
+      - move x0 y100.002 z84 // Move axis X to 0, axis Y to 100.002, axis Z to 84 as fast as possible.
+      - move max // Move all axes to machine upper bounds as fast as possible.
+      - move y 100 f .1 // Move axis Y to 100 at a rate of .1mm per second.
+
+  paint:
+    purpose: Starts paint flow for selected tool. Does not start air.
+    category: Tool Control
+    params:
+      flow:
+        purpose: Value for paint flow expressed as a floating point number between 0.0 and 1.0 inclusive.
+        optional: false
+        accepts:
+          - "<number>"
+  status:
+    purpose: Show status of the machine. Prints out full object model.
+    category: System
+    params:
+      none
