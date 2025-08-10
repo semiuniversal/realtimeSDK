@@ -404,3 +404,112 @@ Security notes:
 ## License
 
 MIT License (see `pyproject.toml`). Use at your own risk. Validate motions in a safe test mode before running live operations.
+
+---
+
+## Appendix: TUI Commands
+
+This appendix summarizes the built-in Textual UI commands, their purpose, key parameters, and examples.
+
+### air — Control air flow
+- Purpose: Toggle air for a tool. Only one air channel can be on at a time.
+- Usage:
+  - `air` (turn on tool 0 air)
+  - `air off` (turn off all air)
+  - `air b` / `air white on`
+- Params:
+  - `state` (optional): on|1|true|yes|off|0|false|no (default: on)
+  - `tool` (optional): 0|a|black|1|b|white (default: 0)
+
+### connect — Open a session
+- Purpose: Connect via serial or HTTP; stores last connection in settings.
+- Usage:
+  - `connect last`
+  - `connect 192.168.86.27`
+  - `connect http last`
+  - `connect com9`
+  - `connect serial`
+  - `connect serial last`
+- Params:
+  - `transport` (optional): http|serial|last
+  - `port` (optional): auto|<port>|last
+  - `baud` (optional): auto|115200|…|last
+  - `ip` (optional): <valid IP>|last
+
+### disconnect — Close session
+- Purpose: Disconnect from the device.
+- Usage: `disconnect`
+
+### draw — Draw a line segment
+- Purpose: Draw with selected tool; waits for motion completion.
+- Usage:
+  - `draw xe 75 ye 122 p 0.2`
+  - `draw xe75 ye122 p.2`
+  - Complex example shown in commands.yaml
+- Key Params:
+  - `tool` (optional): keep|0|a|black|1|b|white (default: keep)
+  - `p` (required): 0.0–1.0 (paint flow)
+  - `f` (optional): max|<number> (mm/s)
+  - `xs,ys,zs` (optional start positions): keep|<number>
+  - `xe,ye` (required end positions): <number>
+  - `ze` (optional end Z): keep|<number>
+  - `ps` (optional end flow): 0.0–1.0
+
+### ip — Query board IP over serial
+- Purpose: Auto-connect over serial and print IP.
+- Usage: `ip`
+
+### exit / quit — Exit the app
+- Purpose: Quit the interactive UI.
+- Usage: `exit` or `quit`
+
+### dot — Draw a spot
+- Purpose: Spray a dot at X/Y/Z for a duration.
+- Usage: `dot tool white p.5 x100 y100 z60 ms100`
+- Params:
+  - `tool` (optional): keep|0|a|black|1|b|white (default: keep)
+  - `p` (required): 0.0–1.0
+  - `x,y,z` (required): <number>
+  - `ms` (required): <integer milliseconds>
+
+### home — Home axes
+- Purpose: Home all or a subset of axes.
+- Usage:
+  - `home` (homes all via G28)
+  - `home z` (homes Z only)
+- Params:
+  - `axes` (optional): all|z (defaults to all)
+
+### gcode — Send raw G-code
+- Purpose: Advanced direct G-code send (single line or sequence). Use with caution.
+- Usage: `gcode <line>`
+
+### help — Show help
+- Purpose: List commands or show details for one command.
+- Usage:
+  - `help`
+  - `help move`
+- Params:
+  - `command` (optional): <command string>
+
+### move — Move the tool head (X/Y/Z)
+- Purpose: Move to absolute positions; constrained by limits.
+- Usage:
+  - `move z 10`
+  - `move z10`
+  - `move x0 y100.002 z84`
+  - `move max`
+  - `move y 100 f .1`
+- Params:
+  - `x,y,z` (optional): <number>|max
+  - `f` (optional): max|<number> (mm/s)
+
+### paint — Start paint flow
+- Purpose: Set paint flow for the selected tool (does not start air).
+- Usage: `paint flow 0.5`
+- Params:
+  - `flow` (required): 0.0–1.0
+
+### status — Show full object model
+- Purpose: Print status (object model) from M408 S2.
+- Usage: `status`

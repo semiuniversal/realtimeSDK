@@ -1,7 +1,6 @@
 
 .venv/
 .vscode/
-*__pycache__/
-*.pyc
-*.pyo
-*.pyd
+__pycache__/
+*.py[cod]
+*$py.class
