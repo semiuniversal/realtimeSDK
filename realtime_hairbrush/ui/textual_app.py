@@ -46,12 +46,14 @@ class AirbrushTextualApp(App):
         self.state = state
         self.poller: Optional[StatusPoller] = None
         self._listener_attached = False
+        # Verbosity (OFF by default to suppress polling spam)
+        self._verbose: bool = False
         # Command history
         self._history: list[str] = []
         self._hist_pos: Optional[int] = None
         self._commands = [
             "help","connect","disconnect","home","move","tool",
-            "air","paint","dot","draw","ip","gcode","settings","status"
+            "air","paint","dot","draw","ip","gcode","settings","status","verbose"
         ]
 
         # Widgets
@@ -64,6 +66,7 @@ class AirbrushTextualApp(App):
         self.status_widget = Static(self._status_block_text(), id="status")
         self.high_log = RichLog(id="high", wrap=False)
         self.high_log.write("[High-level messages]\nType 'help' for commands.\n")
+        self.high_log.write("Verbose: OFF\n")
         self.gcode_log = RichLog(id="gcode", wrap=False)
         self.gcode_log.write("[Raw G-code stream]\n")
         self.input_widget = Input(placeholder="> type commands here", id="input")
@@ -298,52 +301,33 @@ class AirbrushTextualApp(App):
                     for line in [
                         "  help",
                         "  connect serial <port> [baud]",
-                        "  connect serial auto",
-                        "  connect serial last",
                         "  connect http <ip>",
-                        "  connect http last",
-                        "  connect last",
                         "  disconnect",
                         "  home",
                         "  move x.. y.. [z..] [f..]",
                         "  tool N",
                         "  air [on|off] [tool]",
-                        "  paint <flow 0..1>",
-                        "  dot tool? p <0..1> x <num> y <num> z <num> ms <int>",
-                        "  draw [args...]",
+                        "  paint flow <0..1>",
+                        "  dot ...",
+                        "  draw ...",
                         "  ip",
+                        "  gcode <raw>",
                         "  status",
-                        "  gcode <raw gcode>",
-                        "  settings show",
-                        "  settings clear",
+                        "  verbose on|off",
                     ]:
                         self.high_log.write(line)
                 return
-            if cmd in ("exit", "quit"):
-                self.exit()
-                return
-            if cmd == "settings":
-                if not rest:
-                    # default to show
-                    data = load_settings()
-                    if self.high_log:
-                        self.high_log.write("Settings:")
-                        self.high_log.write(str(data or {}))
-                    return
-                sub = rest[0].lower()
-                if sub == "show":
-                    data = load_settings()
-                    if self.high_log:
-                        self.high_log.write("Settings:")
-                        self.high_log.write(str(data or {}))
-                    return
-                if sub == "clear":
-                    clear_settings()
-                    if self.high_log:
-                        self.high_log.write("Settings cleared.")
-                    return
+            if cmd == "verbose":
+                val = (rest[0].lower() if rest else "").strip()
+                if val in ("on", "1", "true", "yes"):
+                    self._verbose = True
+                elif val in ("off", "0", "false", "no"):
+                    self._verbose = False
+                else:
+                    # Toggle if no/invalid arg
+                    self._verbose = not self._verbose
                 if self.high_log:
-                    self.high_log.write(f"[error] Unknown settings subcommand: {sub}")
+                    self.high_log.write(f"Verbose: {'ON' if self._verbose else 'OFF'}")
                 return
             if cmd == "connect":
                 if len(rest) < 1:
@@ -878,31 +862,38 @@ class AirbrushTextualApp(App):
                 self.high_log.write(f"[error] {e}")
 
     def _handle_event(self, ev) -> None:
-        # Always show raw G-code stream arrows
+        # Always show raw G-code stream arrows, except suppress poller spam when verbose OFF
         try:
             from realtime_hairbrush.runtime.events import SentEvent, ReceivedEvent, AckEvent, ErrorEvent, StateUpdatedEvent
         except Exception:
             return
         if isinstance(ev, SentEvent):
             if self.gcode_log:
-                self.gcode_log.write(escape(f"→ {ev.line}"))
+                line = (ev.line or "")
+                if (not self._verbose) and line.strip().startswith("M408"):
+                    return
+                self.gcode_log.write(escape(f"→ {line}"))
             return
         if isinstance(ev, ReceivedEvent):
             if self.gcode_log:
                 txt = (ev.line or "").strip()
-                if txt:
-                    # If JSON substring exists, compress to one line
-                    if "{" in txt and "}" in txt:
-                        try:
-                            import json
-                            js = txt[txt.find("{") : txt.rfind("}") + 1]
-                            obj = json.loads(js)
-                            compact = json.dumps(obj, separators=(",", ":"))
-                            self.gcode_log.write(escape(f"← {compact}"))
-                            return
-                        except Exception:
-                            pass
-                    self.gcode_log.write(escape(f"← {txt}"))
+                if not txt:
+                    return
+                # Suppress object-model JSON when verbose is OFF
+                if (not self._verbose) and (txt.startswith("{") or '"status"' in txt):
+                    return
+                # If JSON substring exists, compress to one line
+                if "{" in txt and "}" in txt:
+                    try:
+                        import json
+                        js = txt[txt.find("{") : txt.rfind("}") + 1]
+                        obj = json.loads(js)
+                        compact = json.dumps(obj, separators=(",", ":"))
+                        self.gcode_log.write(escape(f"← {compact}"))
+                        return
+                    except Exception:
+                        pass
+                self.gcode_log.write(escape(f"← {txt}"))
             return
         if isinstance(ev, AckEvent):
             instr = (ev.instruction or "").strip()
