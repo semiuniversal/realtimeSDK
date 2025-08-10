@@ -195,6 +195,7 @@ DWC is the browser UI for RepRapFirmware. It allows you to inspect the machine, 
 
 Important:
 - IP discovery: Use the serial path in this app to retrieve the IP (`ip`), then open DWC at `http://<ip>`
+- The Duet board may become confused if there is more than one client connected to it. Therefore, please ensure that you have exited the TUI before using DWC. If this happens, a hardware restart may be required to clear up the problem. Alternatively, you could try entering an M999 code through DWC, which should cause the system to reload.
 - Strongly recommended: Reserve a static IP (DHCP reservation) for your Duet in your router. This prevents IP changes and eliminates serial lookups in daily use.
 - Safety/caution: The provided configuration and macros are pre-tuned. Changing limits, steps/mm, homing, tool offsets, or safety macros can cause dangerous motion. Backup first; validate with clearances.
 
