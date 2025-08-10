@@ -11,7 +11,6 @@ import os
 from realtime_hairbrush.transport.airbrush_transport import AirbrushTransport
 from realtime_hairbrush.transport.config import ConnectionConfig
 from realtime_hairbrush.config.manager import ConfigManager
-from realtime_hairbrush.cli.utils.interactive import AirbrushShell
 from realtime_hairbrush.runtime import Dispatcher, MachineState
 from realtime_hairbrush.runtime.events import SentEvent, ReceivedEvent, AckEvent, ErrorEvent, StateUpdatedEvent
 from realtime_hairbrush.runtime.readers import StatusPoller

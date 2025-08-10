@@ -1,18 +1,18 @@
 <#
 .SYNOPSIS
-    Setup script for Python project environment using uv, with preemptive deletion of `.venv`.
+    Setup script for Python project environment using uv sync.
 
 .DESCRIPTION
-    Deletes `.venv` if it exists, installs 'uv' if missing, creates a new virtual environment, activates it,
-    installs project dependencies, and provides user-friendly messages.
+    Installs 'uv' if missing, sets up project environment using 'uv sync',
+    and provides user-friendly messages with multiple usage options.
 #>
 
-function Write-Seperator {
+function Write-Separator {
     Write-Host ('-'*60) -ForegroundColor DarkGray
 }
 
 Write-Host "Starting project environment setup..." -ForegroundColor Cyan
-Write-Seperator
+Write-Separator
 
 # --- Step 1: Check if 'uv' command exists; install if not ---
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
@@ -28,9 +28,8 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
         }
 
         if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-            Write-Warning "'uv' was installed but is not available in the current PowerShell session."
-            Write-Warning "Please CLOSE this PowerShell window and OPEN a NEW ONE to continue."
-            Write-Warning "After restarting PowerShell, rerun this script (or run setup steps manually)."
+            Write-Host "'uv' was installed but not found in the current shell." -ForegroundColor Yellow
+            Write-Host "Please CLOSE and REOPEN your terminal, then rerun this script." -ForegroundColor Cyan
             exit 0
         } else {
             Write-Host "'uv' installed successfully!" -ForegroundColor Green
@@ -45,7 +44,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     Write-Host "'uv' command is already installed." -ForegroundColor Green
 }
 
-Write-Seperator
+Write-Separator
 
 # --- Step 2: Preemptively remove existing .venv virtual environment ---
 if (Test-Path ".venv") {
@@ -62,65 +61,75 @@ if (Test-Path ".venv") {
     Write-Host "No existing '.venv' directory found. Proceeding..."
 }
 
-Write-Seperator
+Write-Separator
 
-# --- Step 3: Create new virtual environment ---
-Write-Host "Creating virtual environment with 'uv venv'..." -ForegroundColor Cyan
-uv venv
+# --- Step 3: Setup project environment using uv sync ---
+Write-Host "Setting up project environment using 'uv sync'..." -ForegroundColor Cyan
+Write-Host "This will create a virtual environment and install all dependencies..." -ForegroundColor Gray
+uv sync
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Failed to create virtual environment. Please check uv installation."
+    Write-Error "Project setup failed. Please check uv installation and pyproject.toml configuration."
     exit 1
 }
-Write-Host "Virtual environment created successfully." -ForegroundColor Green
+Write-Host "Project environment set up successfully." -ForegroundColor Green
 
-Write-Seperator
+Write-Separator
 
-# --- Step 4: Activate the virtual environment with fallback paths ---
-$activateScript = Join-Path -Path ".venv" -ChildPath "Scripts\Activate.ps1"
+# --- Step 4: Verify the installation ---
+Write-Host "Verifying installation..." -ForegroundColor Cyan
 
-if (-not (Test-Path $activateScript)) {
-    $activateScript = Join-Path -Path ".venv" -ChildPath "bin/Activate.ps1"
-}
-
-if (Test-Path $activateScript) {
-    Write-Host "Activating the virtual environment from path: $activateScript"
-    . $activateScript
-    Write-Host "Virtual environment activated." -ForegroundColor Green
-} else {
-    Write-Error "Could not find activation script at expected paths:
-    .venv\Scripts\Activate.ps1
-    .venv/bin/Activate.ps1"
-    exit 1
-}
-
-Write-Seperator
-
-# --- Step 5: Verify python interpreter inside venv ---
-$pythonExe = Join-Path -Path ".venv\Scripts" -ChildPath "python.exe"
+$pythonExe = ".venv\Scripts\python.exe"
 if (-not (Test-Path $pythonExe)) {
-    Write-Error "Python interpreter not found at '$pythonExe'. Virtual environment creation may have failed."
-    exit 1
+    $pythonExe = ".venv\bin\python"
 }
 
-Write-Seperator
-
-# --- Step 6: Install dependencies ---
-Write-Host "Installing dependencies in editable mode using 'uv pip install -e .'..." -ForegroundColor Cyan
-uv pip install -e .
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Dependency installation failed."
-    exit 1
+if (Test-Path $pythonExe) {
+    Write-Host "Virtual environment created at '.venv\'" -ForegroundColor Green
+    $pythonVersion = & $pythonExe --version
+    Write-Host "Python interpreter: $pythonVersion" -ForegroundColor Green
+    
+    # Test the module import
+    Write-Host "Testing module import..." -ForegroundColor Gray
+    try {
+        $testResult = & $pythonExe -c "import realtime_hairbrush; print('✓ realtime_hairbrush imported successfully!')" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host $testResult -ForegroundColor Green
+            Write-Host "Module verification passed." -ForegroundColor Green
+        } else {
+            Write-Host "Warning: Module import test failed. Installation may be incomplete." -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "Warning: Could not test module import." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "Warning: Virtual environment not found at expected location." -ForegroundColor Yellow
 }
 
-Write-Host "Dependencies installed successfully." -ForegroundColor Green
-
-Write-Seperator
+Write-Separator
 
 # --- Final message ---
 Write-Host "Setup complete! 🎉" -ForegroundColor Green
-Write-Host "Use 'python' inside this environment to run commands."
-Write-Host "Remember: on new PowerShell sessions, activate the venv by running:" -ForegroundColor Yellow
-Write-Host "    . .venv\Scripts\Activate.ps1" -ForegroundColor Cyan
-Write-Seperator
+Write-Host ""
+Write-Host "Your project is ready to use. Choose your preferred workflow:" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "OPTION 1: Activate the virtual environment (traditional approach):" -ForegroundColor White
+Write-Host "   .\.venv\Scripts\Activate.ps1" -ForegroundColor Gray
+Write-Host "   python -c `"import realtime_hairbrush; print('Ready to use!')`"" -ForegroundColor Gray
+Write-Host "   # Environment stays active until you run 'deactivate'" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "OPTION 2: Use uv run for individual commands (no persistent activation):" -ForegroundColor White
+Write-Host "   uv run python -c `"import realtime_hairbrush; print('Ready to use!')`"" -ForegroundColor Gray
+Write-Host "   uv run airbrush tui-textual" -ForegroundColor Gray
+Write-Host "   # Each command runs in venv but doesn't stay active" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "OPTION 3: Use the Python interpreter directly:" -ForegroundColor White
+Write-Host "   .\.venv\Scripts\python.exe -c `"import realtime_hairbrush; print('Ready to use!')`"" -ForegroundColor Gray
+Write-Host ""
+Write-Host "Key differences:" -ForegroundColor Yellow
+Write-Host "• Option 1: Activates venv persistently until you deactivate" -ForegroundColor DarkGray
+Write-Host "• Option 2: Runs each command in venv but returns to normal shell" -ForegroundColor DarkGray
+Write-Host "• Option 3: Direct execution without activation" -ForegroundColor DarkGray
+Write-Separator
 
 exit 0

@@ -1,7 +1,9 @@
 last:
   baud: 115200
   fingerprint:
-    firmware_name: RpaFrwr
+    electronics: ''
+    firmware_name: ''
+    firmware_version: ''
   ip: 192.168.86.27
   serial_port: COM4
-  transport: serial
+  transport: http

@@ -9,34 +9,49 @@ separator() {
 echo "Starting project environment setup..."
 separator
 
-# Step 1: Check if 'uv' command is available
+# --- Detect Operating System ---
+OS_TYPE="$(uname -s)"
+case "$OS_TYPE" in
+    Linux*)     os="Linux";;
+    Darwin*)    os="MacOS";;
+    CYGWIN*|MINGW*|MSYS*) os="Windows";;
+    *)          os="Unknown";;
+esac
+echo "Detected Operating System: $os"
+separator
+
+# --- Check if 'uv' command is available ---
 if ! command -v uv >/dev/null 2>&1; then
     echo "'uv' command not found. Installing 'uv' now..."
 
-    # Detect OS and install uv accordingly
-    # Here assuming curl and bash are available
+    # Use curl or wget to install uv
     if command -v curl >/dev/null 2>&1; then
         bash -c "$(curl -fsSL https://astral.sh/uv/install.sh)" || {
-            echo "Error: Failed to install 'uv'. Please install it manually following instructions at https://astral.sh/uv"
+            echo "Error: Failed to install 'uv'. Please install manually: https://astral.sh/uv"
+            exit 1
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        bash -c "$(wget -qO- https://astral.sh/uv/install.sh)" || {
+            echo "Error: Failed to install 'uv'. Please install manually: https://astral.sh/uv"
             exit 1
         }
     else
-        echo "Error: curl is required to install 'uv' automatically."
-        echo "Please install 'uv' manually following instructions at https://astral.sh/uv"
+        echo "Error: Neither curl nor wget found. Please install 'uv' manually: https://astral.sh/uv"
         exit 1
     fi
 
-    # Try to update PATH in current session to include ~/.local/bin if it exists
-    UV_PATH="$HOME/.local/bin"
-    if [ -d "$UV_PATH" ] && [[ ":$PATH:" != *":$UV_PATH:"* ]]; then
-        export PATH="$UV_PATH:$PATH"
-        echo "Temporarily added '$UV_PATH' to PATH for this session."
+    UV_INSTALL_PATH="$HOME/.local/bin"
+
+    if [ -d "$UV_INSTALL_PATH" ] && [[ ":$PATH:" != *":$UV_INSTALL_PATH:"* ]]; then
+        export PATH="$UV_INSTALL_PATH:$PATH"
+        echo "Temporarily added '$UV_INSTALL_PATH' to PATH for this session."
     fi
 
-    # Check if uv is now available
     if ! command -v uv >/dev/null 2>&1; then
-        echo "'uv' was installed but is not found in the current shell."
-        echo "Please close this terminal and open a new one, then rerun this script."
+        echo "'uv' was installed but not found in the current shell."
+        echo "Please CLOSE and REOPEN your terminal or run:"
+        echo "  export PATH=\"$UV_INSTALL_PATH:\$PATH\""
+        echo "Then rerun this script."
         exit 0
     else
         echo "'uv' installed successfully!"
@@ -47,64 +62,71 @@ fi
 
 separator
 
-# Step 2: Check if virtual environment exists, create if missing
-if [ ! -d ".venv" ]; then
-    echo "Virtual environment '.venv' not found. Creating using 'uv venv'..."
-    uv venv || {
-        echo "Failed to create virtual environment. Please check 'uv' installation."
-        exit 1
-    }
-    echo "Virtual environment created successfully."
+# --- Preemptively remove existing .venv ---
+if [ -d ".venv" ]; then
+    echo "Existing '.venv' directory found. Removing to start fresh..."
+    rm -rf .venv
+    echo "Deleted existing '.venv' directory."
 else
-    echo "Virtual environment '.venv' already exists."
+    echo "No existing '.venv' directory found. Proceeding..."
 fi
 
 separator
 
-# Step 3: Activate the virtual environment
-# Prefer .venv/bin/activate (Unix style)
-ACTIVATE_SCRIPT=".venv/bin/activate"
-
-if [ ! -f "$ACTIVATE_SCRIPT" ]; then
-    echo "Error: Activation script '$ACTIVATE_SCRIPT' not found."
-    echo "Make sure the virtual environment was created correctly."
-    exit 1
-fi
-
-echo "Activating the virtual environment..."
-# shellcheck source=/dev/null
-source "$ACTIVATE_SCRIPT"
-echo "Activate exit code: $?"
-echo "Virtual environment activated."
-
-separator
-
-# Step 4: Verify Python interpreter presence in the virtual environment
-PYTHON_BIN=".venv/bin/python"
-if [ ! -x "$PYTHON_BIN" ]; then
-    echo "Error: Python interpreter not found at '$PYTHON_BIN'."
-    echo "Try deleting '.venv' and rerunning the setup."
-    exit 1
-fi
-
-separator
-
-# Step 5: Install dependencies (editable mode)
-echo "Installing dependencies in editable mode with 'uv pip install -e .'..."
-uv pip install -e . || {
-    echo "Dependency installation failed."
+# --- Setup project environment using uv sync ---
+echo "Setting up project environment using 'uv sync'..."
+echo "This will create a virtual environment and install all dependencies..."
+uv sync || {
+    echo "Project setup failed. Please check 'uv' installation and pyproject.toml configuration."
     exit 1
 }
-echo "Dependencies installed successfully."
+echo "Project environment set up successfully."
 
 separator
 
-# Final message
-echo "Setup complete! 🎉"
-echo "You can now use 'python' inside the activated virtual environment to run commands."
-echo "If you open a new terminal session, remember to activate the environment first by running:"
-echo "  source .venv/bin/activate"
+# --- Verify the installation ---
+echo "Verifying installation..."
+if [ -f ".venv/bin/python" ]; then
+    echo "Virtual environment created at '.venv/'"
+    PYTHON_VERSION=$(.venv/bin/python --version 2>&1)
+    echo "Python interpreter: $PYTHON_VERSION"
+    
+    # Test the module import
+    echo "Testing module import..."
+    if .venv/bin/python -c "import realtime_hairbrush; print('✓ realtime_hairbrush imported successfully!')" 2>/dev/null; then
+        echo "Module verification passed."
+    else
+        echo "Warning: Module import test failed. Installation may be incomplete."
+    fi
+else
+    echo "Warning: Virtual environment not found at expected location."
+fi
 
+separator
+
+
+# --- Final message ---
+echo "Setup complete! 🎉"
+echo ""
+echo "Your project is ready to use. Choose your preferred workflow:"
+echo ""
+echo "OPTION 1: Activate the virtual environment (traditional approach):"
+echo "   source .venv/bin/activate"
+echo "   python -c \"import realtime_hairbrush; print('Ready to use!')\""
+echo "   # Environment stays active until you run 'deactivate'"
+echo ""
+echo "OPTION 2: Use uv run for individual commands (no persistent activation):"
+echo "   uv run python -c \"import realtime_hairbrush; print('Ready to use!')\""
+echo "   uv run airbrush tui-textual"
+echo "   # Each command runs in venv but doesn't stay active"
+echo ""
+echo "OPTION 3: Use the Python interpreter directly:"
+echo "   .venv/bin/python -c \"import realtime_hairbrush; print('Ready to use!')\""
+echo ""
+echo "Key differences:"
+echo "• Option 1: Activates venv persistently until you deactivate"
+echo "• Option 2: Runs each command in venv but returns to normal shell"
+echo "• Option 3: Direct execution without activation"
 separator
 
 exit 0
