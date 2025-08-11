@@ -186,6 +186,10 @@ class HttpTransport(Transport):
         if not self.is_connected():
             raise ConnectionError("Not connected to Duet Web Control")
         
+        # Short-circuit empty reads to avoid HTTP churn
+        if not query_cmd or not str(query_cmd).strip():
+            return None
+        
         try:
             # Send the query command
             self.send_line(query_cmd)
@@ -216,6 +220,28 @@ class HttpTransport(Transport):
             raise TimeoutError(f"Request timed out when querying: {query_cmd}")
         except RequestException as e:
             raise TransportError(f"Failed to query: {str(e)}", {"command": query_cmd})
+
+    def read_reply(self) -> Optional[str]:
+        """Fetch the current rr_reply buffer without sending a new command."""
+        if not self.is_connected():
+            raise ConnectionError("Not connected to Duet Web Control")
+        try:
+            response = self._make_request_with_retry(
+                'GET',
+                f"{self.base_url}/rr_reply",
+                timeout=self.timeout
+            )
+            if response.status_code != 200:
+                return None
+            try:
+                reply_data = response.json()
+                if isinstance(reply_data, dict) and "buff" in reply_data:
+                    return reply_data["buff"]
+                return response.text
+            except (json.JSONDecodeError, ValueError):
+                return response.text
+        except RequestException:
+            return None
     
     def get_status(self) -> Dict[str, Any]:
         """

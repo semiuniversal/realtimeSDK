@@ -1,5 +1,6 @@
 import threading
 import time
+import uuid
 from typing import Callable, List, Optional
 
 from semantic_gcode.gcode.base import GCodeInstruction
@@ -52,7 +53,6 @@ class Dispatcher:
             except Exception:
                 continue
 
-            # Predictive apply before send
             try:
                 self.state.apply_predictive(instr)
             except Exception as e:
@@ -61,53 +61,103 @@ class Dispatcher:
             line = str(instr)
             self._emit(SentEvent(line=line))
 
-            # Ensure connection
             if not self.transport.is_connected():
                 self._emit(ErrorEvent(message="Not connected"))
                 continue
 
-            # If the instruction expects acknowledgement, send via query to obtain initial response
             needs_ack = isinstance(instr, ExpectsAcknowledgement) or isinstance(instr, BlocksExecution)
             if needs_ack:
-                response_accum = ""
+                # Special-case long running M400/G28 with M408 probes
                 try:
-                    first_resp = self.transport.query(line)
-                    if first_resp:
-                        self._emit(ReceivedEvent(line=first_resp))
-                        response_accum += first_resp
+                    dyn_timeout = float(getattr(self.transport.config, "timeout", 10.0))
                 except Exception:
-                    # Surface last error and continue
+                    dyn_timeout = 10.0
+                deadline = time.time() + max(2.0, min(30.0, dyn_timeout))
+                upper = line.strip().upper()
+                is_http = (getattr(self.transport.config, "transport_type", "").lower() == "http")
+
+                if upper.startswith("M400") or upper.startswith("G28"):
+                    # Send the command
+                    first = self.transport.query(line)
+                    if first:
+                        self._emit(ReceivedEvent(line=first))
+                    poll_s = 0.5 if is_http else 0.25
+                    got_ack = False
+                    while time.time() < deadline:
+                        try:
+                            status_txt = self.transport.query("M408 S0") or self.transport.query("M408 S2")
+                        except Exception:
+                            status_txt = None
+                        if status_txt:
+                            self._emit(ReceivedEvent(line=status_txt))
+                            txt = status_txt.strip()
+                            is_idle = ('"status":"I"' in txt) or ('\"status\":\"I\"' in txt) or ('\"status\":\"idle\"' in txt)
+                            if is_idle:
+                                self._emit(AckEvent(instruction=line, ok=True, message="Idle"))
+                                got_ack = True
+                                break
+                        time.sleep(poll_s)
+                    if not got_ack:
+                        self._emit(AckEvent(instruction=line, ok=False, message="Ack timeout"))
+                    time.sleep(0.05)
+                    continue
+
+                # Token-based ack for all other gated commands
+                tag = f"AB#{uuid.uuid4().hex[:8]}"
+                try:
+                    # Send main command
+                    first = self.transport.query(line)
+                    if first:
+                        self._emit(ReceivedEvent(line=first))
+                    # Immediately send token via M118
+                    tok_line = f'M118 S"{tag}"'
+                    self._emit(SentEvent(line=tok_line))
+                    _ = self.transport.query(tok_line)
+                except Exception:
                     try:
                         last_err = self.transport.get_last_error()
                     except Exception:
                         last_err = None
-                    ctx = {"instruction": line}
+                    ctx = {"instruction": line, "tag": tag}
                     if last_err:
                         ctx["last_error"] = last_err
                     self._emit(ErrorEvent(message="Send failed", context=ctx))
                     time.sleep(0.05)
                     continue
 
-                deadline = time.time() + 30.0
+                got_ack = False
+                base_interval = 0.2 if is_http else 0.05
+                interval = base_interval
                 while time.time() < deadline:
-                    resp = self.transport.query("")
+                    time.sleep(interval)
+                    # Read without sending a command when possible (HTTP)
+                    resp = None
+                    try:
+                        if is_http:
+                            # type: ignore[attr-defined]
+                            resp = getattr(self.transport.transport, "read_reply", None)() if hasattr(self.transport, "transport") else None
+                            if resp is None:
+                                # Fallback: try rr_reply via underlying http instance
+                                from semantic_gcode.transport.http import HttpTransport
+                                inner = getattr(self.transport, "transport", None)
+                                if isinstance(inner, HttpTransport):
+                                    resp = inner.read_reply()
+                        if resp is None:
+                            resp = self.transport.query("M408 S0")  # light probe to flush message queue
+                    except Exception:
+                        resp = None
                     if resp:
                         self._emit(ReceivedEvent(line=resp))
-                        response_accum += resp
-                        if isinstance(instr, ExpectsAcknowledgement):
-                            try:
-                                if instr.validate_response(response_accum):
-                                    # Include the last non-empty line as message
-                                    last_line = "".join([r for r in response_accum.splitlines() if r]).strip()
-                                    self._emit(AckEvent(instruction=line, ok=True, message=last_line or None))
-                                    break
-                            except Exception:
-                                pass
-                    time.sleep(0.05)
-                else:
-                    self._emit(AckEvent(instruction=line, ok=False, message="Ack timeout"))
+                        if tag in resp:
+                            self._emit(AckEvent(instruction=line, ok=True, message=tag))
+                            got_ack = True
+                            break
+                        interval = base_interval
+                    else:
+                        interval = min(0.5, interval * 1.5)
 
-            # Non-ack commands: optionally read any immediate response
+                if not got_ack:
+                    self._emit(AckEvent(instruction=line, ok=False, message="Ack timeout"))
             else:
                 ok = self.transport.send_line(line)
                 if not ok:
@@ -125,5 +175,4 @@ class Dispatcher:
                 if resp:
                     self._emit(ReceivedEvent(line=resp))
 
-            # Small pacing between commands to avoid overruns on some serial stacks
             time.sleep(0.05) 

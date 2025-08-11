@@ -319,12 +319,16 @@ class SerialTransport(Transport):
         """
         if not self.is_connected():
             raise TransportError("Not connected")
-            
+        
+        # Short-circuit empty reads to avoid serial churn
+        if not line or not str(line).strip():
+            return ""
+        
         try:
             # Send the command
             if not line.endswith('\n'):
                 line += '\n'
-                
+            
             self._serial.write(line.encode())
             self._serial.flush()
             

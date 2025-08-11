@@ -92,6 +92,11 @@ class AirbrushTransport:
                 # Store the transport globally for persistence between CLI commands
                 global _global_transport
                 _global_transport = self.transport
+                # Seed observed state by requesting one snapshot immediately
+                try:
+                    _ = self.transport.query("M408 S2")
+                except Exception:
+                    pass
             else:
                 self._last_error = "Failed to connect to the Duet board"
             

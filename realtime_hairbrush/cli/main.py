@@ -41,6 +41,12 @@ def cli(ctx, config, verbose):
 
     # If no subcommand provided, launch the Textual TUI by default
     if ctx.invoked_subcommand is None:
+        # Reset session log at app launch
+        try:
+            from realtime_hairbrush.transport.logging_wrapper import reset_session_log
+            reset_session_log()
+        except Exception:
+            pass
         from realtime_hairbrush.ui.textual_app import AirbrushTextualApp
         transport: AirbrushTransport = ctx.obj.get('transport')
         dispatcher = ctx.obj.get('dispatcher')

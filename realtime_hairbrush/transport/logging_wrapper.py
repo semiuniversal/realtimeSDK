@@ -37,6 +37,24 @@ def _get_log_path() -> str:
     return _repo_root_log_path()
 
 
+def _write_header(fh) -> None:
+    fh.write(f"# Airbrush session log started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+
+def reset_session_log() -> None:
+    """Truncate the session log immediately (e.g., at app launch)."""
+    global _log_initialized
+    with _log_init_lock:
+        try:
+            log_path = _get_log_path()
+            with open(log_path, "w", encoding="utf-8") as f:
+                _write_header(f)
+            _log_initialized = True
+        except Exception:
+            # Do not crash if path unwritable
+            pass
+
+
 def _ensure_log_fresh() -> str:
     global _log_initialized
     with _log_init_lock:
@@ -44,7 +62,7 @@ def _ensure_log_fresh() -> str:
         if not _log_initialized:
             try:
                 with open(log_path, "w", encoding="utf-8") as f:
-                    f.write(f"# Airbrush session log started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    _write_header(f)
             except Exception:
                 pass
             _log_initialized = True

@@ -118,6 +118,13 @@ class AirbrushTextualApp(App):
                 pass
         # force an immediate status render tick while first poll is in-flight
         self._update_status()
+        # On startup, if connected, schedule a one-shot deferred snapshot to avoid blocking render
+        if self._agent and self.transport and self.transport.is_connected():
+            try:
+                import asyncio
+                self.call_later(lambda: asyncio.get_event_loop().call_later(0.05, lambda: self._agent.request_snapshot_now()))
+            except Exception:
+                pass
         self.set_interval(0.5, self._update_status)
 
     def on_unmount(self) -> None:
@@ -266,21 +273,23 @@ class AirbrushTextualApp(App):
                 host = self.transport.config.http_host or "-"
         obs = self.state.snapshot().get("observed", {})
         fw_status = obs.get("firmware", {}).get("status")
-        label = {
-            "I": "Idle",
-            "B": "Busy",
-            "P": "Printing",
-            "H": "Homing",
-            "S": "Stopped",
-            "i": "Idle",
-            "busy": "Busy",
-            "idle": "Idle",
-        }.get(fw_status, fw_status or "?")
-        # Keep last known label if unknown
+        label_map = {
+            "I": "Idle", "i": "Idle", "idle": "Idle",
+            "B": "Busy", "busy": "Busy",
+            "P": "Printing", "printing": "Printing",
+            "H": "Homing", "homing": "Homing",
+            "S": "Stopped", "stopped": "Stopped",
+        }
+        label = label_map.get(str(fw_status).strip() if fw_status is not None else None, None)
+        # Keep last known label if unknown or None
         if not hasattr(self, "_last_status_label"):
-            self._last_status_label = label
-        if label == "?":
-            label = self._last_status_label
+            self._last_status_label = "Idle" if (self.transport and self.transport.is_connected()) else "?"
+        if not label:
+            if connected:
+                label = "Idle"
+                self._last_status_label = label
+            else:
+                label = getattr(self, "_last_status_label", "?")
         else:
             self._last_status_label = label
         # Use live machine position for in-flight updates; xyz is the commanded/target position
@@ -289,14 +298,24 @@ class AirbrushTextualApp(App):
             or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("xyz")
             or obs.get("raw_status", {}).get("raw", {}).get("position")
         )
+        homed_list = obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
+        def is_homed_xyz() -> bool:
+            try:
+                return bool(int(homed_list[0])) and bool(int(homed_list[1])) and bool(int(homed_list[2]))
+            except Exception:
+                return False
+        homed_flag = is_homed_xyz()
         def fmt(v):
             try:
                 return f"{float(v):.3f}"
             except Exception:
                 return "-"
-        x = fmt(pos[0]) if isinstance(pos, (list, tuple)) and len(pos) >= 1 else "-"
-        y = fmt(pos[1]) if isinstance(pos, (list, tuple)) and len(pos) >= 2 else "-"
-        z = fmt(pos[2]) if isinstance(pos, (list, tuple)) and len(pos) >= 3 else "-"
+        if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+            x = fmt(pos[0]) if homed_flag else "?"
+            y = fmt(pos[1]) if homed_flag else "?"
+            z = fmt(pos[2]) if homed_flag else "?"
+        else:
+            x = y = z = "?" if homed_flag is False else "-"
         tool = obs.get("raw_status", {}).get("raw", {}).get("currentTool")
         tool_str = str(tool) if tool is not None else "-"
         fan_percent = obs.get("raw_status", {}).get("raw", {}).get("params", {}).get("fanPercent") or []
@@ -311,7 +330,7 @@ class AirbrushTextualApp(App):
         air_str = "ON" if air_on is True else ("OFF" if air_on is False else "-")
         paint_flow = self._get_paint_flow()
         paint_str = (f"{paint_flow:.2f}" if paint_flow is not None else "-")
-        homed = obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
+        homed = homed_list
         def flag(i):
             try:
                 return "1" if int(homed[i]) else "0"
@@ -333,7 +352,8 @@ class AirbrushTextualApp(App):
             conn_label = "Not Connected"
         else:
             conn_label = f"Serial:{host}" if (mode == "serial") else (f"HTTP:{host}" if mode == "http" else "-:-")
-        line1 = f"Status:{label} | ToolPos[X:{x}] [Y:{y}] [Z:{z}] | Coord:Absolute"
+        homed_text = "Yes" if homed_flag else "No"
+        line1 = f"Status:{label} | ToolPos[X:{x}] [Y:{y}] [Z:{z}] | Homed:{homed_text}"
         line2 = f"Tool:{tool_str} | Air:{air_str} | Paint:{paint_str} | Limits:{limits}"
         # Place Not Connected at the start of System line before Vin
         line3 = f"System: [{conn_label}] [Vin {vin} V] [MCU Temp: {mcu_temp} C] [{driver_label}]"
@@ -510,7 +530,10 @@ class AirbrushTextualApp(App):
                 self._listener_attached = True
                 # Immediately fetch full status once on connect
                 try:
-                    self._refresh_status_once()
+                    if self._agent:
+                        self._agent.request_snapshot_now()
+                    else:
+                        self._refresh_status_once()
                 finally:
                     # update UI immediately regardless of fetch outcome
                     self.call_from_thread(self._update_status)
@@ -579,6 +602,17 @@ class AirbrushTextualApp(App):
                 return
             if cmd == "move":
                 # move x.. y.. [z..] [f..]
+                # Block if not homed
+                try:
+                    homed = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
+                    if not (bool(int(homed[0])) and bool(int(homed[1])) and bool(int(homed[2]))):
+                        if self.high_log:
+                            self.high_log.write("[error] Machine is not homed. Please home first.")
+                        return
+                except Exception:
+                    if self.high_log:
+                        self.high_log.write("[error] Machine is not homed. Please home first.")
+                    return
                 kv = {p[0].lower(): p[1:] for p in rest if len(p) >= 2 and p[0].lower() in ("x","y","z","f") and p[1:].replace('.', '', 1).replace('-', '', 1).isdigit()}
                 x = float(kv['x']) if 'x' in kv else None
                 y = float(kv['y']) if 'y' in kv else None
@@ -744,6 +778,17 @@ class AirbrushTextualApp(App):
                 return
             if cmd == "paint":
                 # paint <flow 0..1>
+                # Block if not homed
+                try:
+                    homed = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
+                    if not (bool(int(homed[0])) and bool(int(homed[1])) and bool(int(homed[2]))):
+                        if self.high_log:
+                            self.high_log.write("[error] Machine is not homed. Please home first.")
+                        return
+                except Exception:
+                    if self.high_log:
+                        self.high_log.write("[error] Machine is not homed. Please home first.")
+                    return
                 if not rest:
                     if self.high_log:
                         self.high_log.write("[error] paint requires <flow 0..1>")
@@ -787,6 +832,17 @@ class AirbrushTextualApp(App):
                 return
             if cmd == "dot":
                 # dot tool? p <0..1> x <num> y <num> z <num> ms <int>
+                # Block if not homed
+                try:
+                    homed = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
+                    if not (bool(int(homed[0])) and bool(int(homed[1])) and bool(int(homed[2]))):
+                        if self.high_log:
+                            self.high_log.write("[error] Machine is not homed. Please home first.")
+                        return
+                except Exception:
+                    if self.high_log:
+                        self.high_log.write("[error] Machine is not homed. Please home first.")
+                    return
                 tokens = {rest[i].lower(): rest[i+1] for i in range(0, len(rest)-1, 2) if rest[i].lower() in ("tool","p","x","y","z","ms")}
                 tool_tok = tokens.get("tool")
                 try:
@@ -1168,6 +1224,12 @@ class AirbrushTextualApp(App):
                                 pass
                     except Exception:
                         pass
+                # Route firmware warnings/errors to the high-level pane, keep file logging separate
+                low = txt.lower()
+                if low.startswith("warning") or low.startswith("error"):
+                    if self.high_log:
+                        self.high_log.write(txt)
+                    return
                 # Suppress object-model JSON when verbose is OFF
                 if (not self._verbose) and (txt.startswith("{") or '"status"' in txt):
                     return
