@@ -50,6 +50,10 @@ class AirbrushTextualApp(App):
         self._verbose: bool = False
         # Track whether last sent line was an M408 (to suppress its 'ok' when verbose OFF)
         self._last_sent_was_m408: bool = False
+        # One-shot wait for IP query (fulfilled by ReceivedEvent)
+        self._ip_wait_active: bool = False
+        self._ip_wait_event: threading.Event = threading.Event()
+        self._ip_wait_result: Optional[str] = None
         # Command history
         self._history: list[str] = []
         self._hist_pos: Optional[int] = None
@@ -874,28 +878,26 @@ class AirbrushTextualApp(App):
                             line = "M552"
                         if self.gcode_log:
                             self.gcode_log.write(escape(f"→ {line}"))
+                        # Send and wait for OK, then wait for the subsequent IPv4 line via ReceivedEvent
                         resp = self.transport.query(line)
                         if resp and self.gcode_log:
                             self.gcode_log.write(escape(f"← {resp.strip()}"))
-                        if resp:
-                            # Robustly extract IPv4 in response
-                            try:
-                                import re
-                                m = re.search(r"(\d{1,3}\.){3}\d{1,3}", resp)
-                                if m:
-                                    ip = m.group(0)
-                            except Exception:
-                                ip = None
-                            if not ip:
-                                for ln in resp.splitlines():
-                                    ln = ln.strip()
-                                    if "IP address" in ln:
-                                        parts = ln.replace('=', ' ').replace(':', ' ').split()
-                                        if parts:
-                                            cand = parts[-1].strip().strip('.,;')
-                                            if re.match(r"(\d{1,3}\.){3}\d{1,3}", cand):
-                                                ip = cand
-                                                break
+                        # Begin wait for the asynchronous IPv4 line
+                        self._ip_wait_active = True
+                        self._ip_wait_result = None
+                        try:
+                            self._ip_wait_event.clear()
+                        except Exception:
+                            pass
+                        # Wait up to 8 seconds for the IP line to appear
+                        try:
+                            self._ip_wait_event.wait(8.0)
+                        except Exception:
+                            pass
+                        if self._ip_wait_result:
+                            ip = self._ip_wait_result
+                        self._ip_wait_active = False
+                        self._ip_wait_result = None
                     if self.high_log:
                         self.high_log.write(f"IP: {ip or 'unknown'}")
                 except Exception as e:
@@ -972,6 +974,19 @@ class AirbrushTextualApp(App):
                 txt = (ev.line or "").strip()
                 if not txt:
                     return
+                # Fulfill one-shot IP wait if an IPv4 appears in a subsequent line
+                if self._ip_wait_active:
+                    try:
+                        import re
+                        m = re.search(r"(\d{1,3}\.){3}\d{1,3}", txt)
+                        if m:
+                            self._ip_wait_result = m.group(0)
+                            try:
+                                self._ip_wait_event.set()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 # Suppress object-model JSON when verbose is OFF
                 if (not self._verbose) and (txt.startswith("{") or '"status"' in txt):
                     return
