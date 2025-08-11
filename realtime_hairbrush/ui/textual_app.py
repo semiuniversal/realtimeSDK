@@ -53,7 +53,7 @@ class AirbrushTextualApp(App):
         self._hist_pos: Optional[int] = None
         self._commands = [
             "help","connect","disconnect","home","move","tool",
-            "air","paint","dot","draw","ip","gcode","settings","status","verbose"
+            "air","paint","dot","draw","ip","gcode","settings","status","verbose","exit","quit"
         ]
 
         # Widgets
@@ -316,6 +316,7 @@ class AirbrushTextualApp(App):
                         "  gcode <raw>",
                         "  status",
                         "  verbose on|off",
+                        "  exit | quit",
                     ]:
                         self.high_log.write(line)
                 return
@@ -347,6 +348,9 @@ class AirbrushTextualApp(App):
                     return
                 if self.high_log:
                     self.high_log.write(f"[error] Unknown settings subcommand: {sub}")
+                return
+            if cmd in ("exit", "quit"):
+                self.exit()
                 return
             if cmd == "connect":
                 if len(rest) < 1:
