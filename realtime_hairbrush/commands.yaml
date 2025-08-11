@@ -286,8 +286,15 @@ commands:
         optional: false
         accepts:
           - "<number>"
+
   status:
     purpose: Show status of the machine. Prints out full object model.
     category: System
     params:
       none
+
+  estop:
+    purpose: Emergency stop / firmware reset (M999). Device may reset and disconnect.
+    category: System
+    usage-examples:
+      - estop

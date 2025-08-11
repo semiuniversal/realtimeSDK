@@ -335,6 +335,7 @@ class AirbrushTextualApp(App):
                         "  gcode <raw>",
                         "  status",
                         "  verbose on|off",
+                        "  estop",
                         "  exit | quit",
                     ]:
                         self.high_log.write(line)
@@ -373,7 +374,7 @@ class AirbrushTextualApp(App):
                 return
             # Connection guard for commands that require an active transport
             requires_connection = cmd in {
-                "home","move","tool","air","paint","dot","draw","gcode","status"
+                "home","move","tool","air","paint","dot","draw","gcode","status","estop"
             }
             if requires_connection and (not self.transport or not self.transport.is_connected()):
                 if self.high_log:
@@ -444,19 +445,36 @@ class AirbrushTextualApp(App):
                 else:
                     if self.high_log: self.high_log.write("[error] connect serial|http ...")
                     return
+                # Teardown any prior runtime
+                if self.poller:
+                    try:
+                        self.poller.stop()
+                    except Exception:
+                        pass
+                    self.poller = None
+                self._listener_attached = False
+                if self.dispatcher:
+                    try:
+                        # Best-effort stop if implemented
+                        stop = getattr(self.dispatcher, "stop", None)
+                        if callable(stop):
+                            stop()
+                    except Exception:
+                        pass
+                    self.dispatcher = None
+                # Create new transport and connect
                 self.transport = AirbrushTransport(cfg)
                 if not self.transport.connect():
                     if self.high_log:
                         self.high_log.write(f"[error] connect failed: {self.transport.get_last_error()}")
                     return
-                # Create dispatcher/poller if needed
-                if not self.dispatcher:
-                    self.dispatcher = Dispatcher(self.transport, self.state)
-                    self.dispatcher.on_event(lambda ev: self.call_from_thread(self._handle_event, ev))
-                    self.dispatcher.start()
-                if not self.poller:
-                    self.poller = StatusPoller(self.transport, self.state, emit=self._emit_event_safe, interval=0.5)
-                    self.poller.start()
+                # Create fresh dispatcher/poller
+                self.dispatcher = Dispatcher(self.transport, self.state)
+                self.dispatcher.on_event(lambda ev: self.call_from_thread(self._handle_event, ev))
+                self.dispatcher.start()
+                self._listener_attached = True
+                self.poller = StatusPoller(self.transport, self.state, emit=self._emit_event_safe, interval=2.0)
+                self.poller.start()
                 # Immediately fetch full status once on connect
                 try:
                     self._refresh_status_once()
@@ -484,14 +502,32 @@ class AirbrushTextualApp(App):
                 self.call_from_thread(self._update_status)
                 return
             if cmd == "disconnect":
+                # Stop poller
                 if self.poller:
                     try:
                         self.poller.stop()
                     except Exception:
                         pass
                     self.poller = None
+                # Stop dispatcher
+                if self.dispatcher:
+                    try:
+                        stop = getattr(self.dispatcher, "stop", None)
+                        if callable(stop):
+                            stop()
+                    except Exception:
+                        pass
+                    self.dispatcher = None
+                self._listener_attached = False
+                # Disconnect transport
                 if self.transport and self.transport.is_connected():
-                    self.transport.disconnect()
+                    try:
+                        self.transport.disconnect()
+                    except Exception:
+                        pass
+                self.transport = None
+                # Reset status timestamps to mark as not connected
+                self._last_status_ts = 0.0
                 if self.high_log:
                     self.high_log.write("Disconnected")
                 self.call_from_thread(self._update_status)
@@ -954,6 +990,25 @@ class AirbrushTextualApp(App):
                         observed["object_model"] = model
                     self.state.update_observed(observed)
                     self._update_status()
+                return
+            if cmd == "estop":
+                # Emergency stop/reset (M999). Warn that connection may reset.
+                try:
+                    from semantic_gcode.dict.gcode_commands.M999.M999 import M999_EmergencyStop
+                    estop = M999_EmergencyStop.create()
+                    line = str(estop)
+                except Exception:
+                    line = "M999"
+                if self.gcode_log:
+                    self.gcode_log.write(escape(f"→ {line}"))
+                try:
+                    # Use send_line instead of query; firmware may reset immediately
+                    self.transport.send_line(line)
+                except Exception as e:
+                    if self.high_log:
+                        self.high_log.write(f"[error] estop: {e}")
+                if self.high_log:
+                    self.high_log.write("E-Stop sent (M999). Device may reset; connection may drop.")
                 return
             if self.high_log:
                 self.high_log.write(f"[error] Unknown command: {cmd}")

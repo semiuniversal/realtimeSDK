@@ -180,6 +180,7 @@ Type `help` to list available commands.
 - `tool <index>`
 - `ip` (discover IP via serial)
 - `status` (one-shot M408 S2)
+- `estop` (M999 emergency stop/reset; device may reset/disconnect)
 
 ### Status Details
 
@@ -513,3 +514,7 @@ This appendix summarizes the built-in Textual UI commands, their purpose, key pa
 ### status — Show full object model
 - Purpose: Print status (object model) from M408 S2.
 - Usage: `status`
+
+### estop — Emergency stop/reset
+- Purpose: Send M999 to immediately reset/stop the device. Connection may drop.
+- Usage: `estop`
