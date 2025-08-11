@@ -84,7 +84,9 @@ class AirbrushTextualApp(App):
             self.dispatcher.on_event(lambda ev: self.call_from_thread(self._handle_event, ev))
             self._listener_attached = True
         if self.transport and self.transport.is_connected() and not self.poller:
-            self.poller = StatusPoller(self.transport, self.state, emit=self._emit_event_safe, interval=0.5)
+            # Global poll interval: slower (2.0s) to reduce contention on all transports
+            poll_interval = 2.0
+            self.poller = StatusPoller(self.transport, self.state, emit=self._emit_event_safe, interval=poll_interval)
             self.poller.start()
         # force an immediate status render tick while first poll is in-flight
         self._update_status()
@@ -328,6 +330,23 @@ class AirbrushTextualApp(App):
                     self._verbose = not self._verbose
                 if self.high_log:
                     self.high_log.write(f"Verbose: {'ON' if self._verbose else 'OFF'}")
+                return
+            if cmd == "settings":
+                # settings [show|clear]
+                sub = (rest[0].lower() if rest else "show")
+                if sub == "show":
+                    data = load_settings()
+                    if self.high_log:
+                        self.high_log.write("Settings:")
+                        self.high_log.write(str(data or {}))
+                    return
+                if sub == "clear":
+                    clear_settings()
+                    if self.high_log:
+                        self.high_log.write("Settings cleared.")
+                    return
+                if self.high_log:
+                    self.high_log.write(f"[error] Unknown settings subcommand: {sub}")
                 return
             if cmd == "connect":
                 if len(rest) < 1:
