@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional
 import threading
 import time
+import os
 
 from textual import events
 from textual.app import App, ComposeResult
@@ -10,7 +11,7 @@ from textual.containers import Vertical, Horizontal
 from textual.widgets import Static, Input, Footer, RichLog
 from rich.markup import escape
 
-from realtime_hairbrush.runtime import Dispatcher, MachineState
+from realtime_hairbrush.runtime import Dispatcher, MachineState, ObjectModelAgent
 from realtime_hairbrush.runtime.events import (
     SentEvent,
     ReceivedEvent,
@@ -57,7 +58,7 @@ class AirbrushTextualApp(App):
         self._ip_wait_result: Optional[str] = None
         # Track last time we saw a status update to detect stale connection
         self._last_status_ts: float = 0.0
-        # Temporary motion refresh timer (Textual timer) to boost status during moves
+        # Temporary motion refresh timer (Textual timer) to boost status during moves (legacy path)
         self._motion_refresh_timer = None
         self._motion_refresh_inflight: bool = False
         self._last_machine_pos = None
@@ -75,6 +76,11 @@ class AirbrushTextualApp(App):
         self.high_log: Optional[RichLog] = None
         self.gcode_log: Optional[RichLog] = None
         self.input_widget: Optional[Input] = None
+
+        # Async ObjectModelAgent (optional)
+        # Enable async agent by default in this branch; allow opt-out via AIRBRUSH_ASYNC=0
+        self._use_async_agent = os.getenv("AIRBRUSH_ASYNC", "1") not in ("0", "false", "False")
+        self._agent: Optional[ObjectModelAgent] = ObjectModelAgent() if self._use_async_agent else None
 
     def compose(self) -> ComposeResult:
         self.status_widget = Static(self._status_block_text(), id="status")
@@ -97,6 +103,19 @@ class AirbrushTextualApp(App):
         if self.dispatcher and not self._listener_attached:
             self.dispatcher.on_event(lambda ev: self.call_from_thread(self._handle_event, ev))
             self._listener_attached = True
+        # Disable legacy StatusPoller if async agent is used
+        if self._agent:
+            self.poller = None
+        # Start async ObjectModelAgent if enabled
+        if self._agent and self.transport:
+            try:
+                self._agent.set_transport(self.transport)
+                self._agent.set_verbose(self._verbose)
+                self._agent.on_change(lambda patch: self.call_from_thread(self._merge_observed_patch, patch))
+                import asyncio
+                asyncio.get_event_loop().create_task(self._agent.start())
+            except Exception:
+                pass
         # force an immediate status render tick while first poll is in-flight
         self._update_status()
         self.set_interval(0.5, self._update_status)
@@ -105,6 +124,12 @@ class AirbrushTextualApp(App):
         if self.poller:
             try:
                 self.poller.stop()
+            except Exception:
+                pass
+        if self._agent:
+            try:
+                import asyncio
+                asyncio.get_event_loop().create_task(self._agent.stop())
             except Exception:
                 pass
 
@@ -162,6 +187,13 @@ class AirbrushTextualApp(App):
 
     def _refresh_status_once(self) -> None:
         if not self.transport or not self.transport.is_connected():
+            return
+        # If async agent is active, delegate to it and avoid direct M408 here
+        if self._agent:
+            try:
+                self._agent.request_snapshot_now()
+            except Exception:
+                pass
             return
         try:
             from semantic_gcode.dict.gcode_commands.M408.M408 import M408_ReportObjectModel
@@ -615,6 +647,12 @@ class AirbrushTextualApp(App):
                 else:
                     self.transport.send_line(str(g1))
                     self.transport.query(str(m400))
+                # Notify async agent that motion is active; it will poll coords faster during motion
+                if self._agent:
+                    try:
+                        self._agent.set_motion_state(True)
+                    except Exception:
+                        pass
                 # Do not immediately set predictive final pos in status bar; rely on observed polling
                 return
             if cmd == "tool":
@@ -1014,7 +1052,20 @@ class AirbrushTextualApp(App):
                         self.transport.send_line(line)
                 return
             if cmd == "status":
-                # Send M408 S2, log arrows, parse and update
+                # If async agent is enabled, request snapshot via agent and return
+                if self._agent:
+                    if not self.transport or not self.transport.is_connected():
+                        if self.high_log:
+                            self.high_log.write("[error] Not connected")
+                        return
+                    try:
+                        self._agent.request_snapshot_now()
+                        if self.high_log:
+                            self.high_log.write("Requested status snapshot (agent)")
+                    except Exception:
+                        pass
+                    return
+                # Legacy direct M408 S2
                 if not self.transport or not self.transport.is_connected():
                     if self.high_log:
                         self.high_log.write("[error] Not connected")
@@ -1083,13 +1134,19 @@ class AirbrushTextualApp(App):
             try:
                 ln = (ev.line or "").strip()
                 if ln.startswith("G1") or ln.startswith("G28"):
-                    # Start/replace a 0.5s interval to refresh status while in motion
-                    if self._motion_refresh_timer is not None:
+                    # Start/replace a 0.5s interval to refresh status while in motion (legacy)
+                    if self._agent:
                         try:
-                            self._motion_refresh_timer.cancel()
+                            self._agent.set_motion_state(True)
                         except Exception:
                             pass
-                    self._motion_refresh_timer = self.set_interval(0.25, self._refresh_coords_machine)
+                    else:
+                        if self._motion_refresh_timer is not None:
+                            try:
+                                self._motion_refresh_timer.cancel()
+                            except Exception:
+                                pass
+                        self._motion_refresh_timer = self.set_interval(0.25, self._refresh_coords_machine)
             except Exception:
                 pass
             return
@@ -1144,6 +1201,12 @@ class AirbrushTextualApp(App):
                         self._motion_refresh_timer = None
                 except Exception:
                     pass
+                # Signal agent that motion ended
+                if self._agent:
+                    try:
+                        self._agent.set_motion_state(False)
+                    except Exception:
+                        pass
                 self._refresh_status_once()
                 self._last_status_ts = time.time()
                 # Restore prior transport timeout after gated motion completes

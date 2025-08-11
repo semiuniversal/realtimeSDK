@@ -60,15 +60,14 @@ class AirbrushTransport:
                 return True
                 
             if self.config.transport_type == "serial":
-                self.transport = SerialTransport(
+                base = SerialTransport(
                     port=self.config.serial_port,
-                    baud_rate=self.config.serial_baudrate,  # Changed from baudrate to baud_rate
+                    baud_rate=self.config.serial_baudrate,
                     timeout=self.config.timeout
                 )
             elif self.config.transport_type == "http":
-                # Use the correct parameter name 'url' instead of 'host'
                 url = f"http://{self.config.http_host}"
-                self.transport = HttpTransport(
+                base = HttpTransport(
                     url=url,
                     password=self.config.http_password,
                     timeout=self.config.timeout
@@ -76,6 +75,17 @@ class AirbrushTransport:
             else:
                 self._last_error = f"Unsupported transport type: {self.config.transport_type}"
                 return False
+
+            # Wrap with logging decorator if enabled (default on)
+            try:
+                from .logging_wrapper import LoggingTransport
+                # Always enable logging in this branch unless explicitly disabled
+                if os.getenv("AIRBRUSH_LOG", "1") in ("0", "false", "False"):
+                    self.transport = base
+                else:
+                    self.transport = LoggingTransport(base)
+            except Exception:
+                self.transport = base
 
             self._connected = self.transport.connect()
             if self._connected:
