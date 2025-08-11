@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 import threading
+import time
 
 from textual import events
 from textual.app import App, ComposeResult
@@ -54,6 +55,8 @@ class AirbrushTextualApp(App):
         self._ip_wait_active: bool = False
         self._ip_wait_event: threading.Event = threading.Event()
         self._ip_wait_result: Optional[str] = None
+        # Track last time we saw a status update to detect stale connection
+        self._last_status_ts: float = 0.0
         # Command history
         self._history: list[str] = []
         self._hist_pos: Optional[int] = None
@@ -169,6 +172,7 @@ class AirbrushTextualApp(App):
                 observed = {"firmware": {"status": parsed.get("status")}, "raw_status": parsed}
                 self.state.update_observed(observed)
                 self._update_status()
+                self._last_status_ts = time.time()
         except Exception:
             pass
 
@@ -220,7 +224,9 @@ class AirbrushTextualApp(App):
     def _status_block_text(self) -> str:
         mode = None
         host = "-"
-        if self.transport:
+        connected = False
+        if self.transport and self.transport.is_connected():
+            connected = True
             mode = self.transport.config.transport_type
             if mode == "serial":
                 host = self.transport.config.serial_port or "-"
@@ -238,6 +244,10 @@ class AirbrushTextualApp(App):
             "busy": "Busy",
             "idle": "Idle",
         }.get(fw_status, fw_status or "?")
+        # Consider status stale if no update in > 6s (3x 2s polling) and mark as not connected for UI
+        is_stale = (time.time() - self._last_status_ts) > 6.0 if self._last_status_ts > 0 else False
+        if (not connected) or is_stale:
+            label = "Not Connected"
         # Use live machine position for in-flight updates; xyz is the commanded/target position
         pos = (
             obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("machine")
@@ -285,7 +295,10 @@ class AirbrushTextualApp(App):
         driver_label = f"Driver temp: {'WARNING' if overtemp else driver_temp}"
         ends = obs.get("endstops", {})
         ends_list = " ".join([f"{k}:{'1' if v else '0'}" for k, v in ends.items()]) if ends else ""
-        conn_label = f"Serial:{host}" if (mode == "serial") else (f"HTTP:{host}" if mode == "http" else "-:-")
+        if (not connected) or is_stale:
+            conn_label = "Not Connected"
+        else:
+            conn_label = f"Serial:{host}" if (mode == "serial") else (f"HTTP:{host}" if mode == "http" else "-:-")
         line1 = f"Status:{label} | ToolPos[X:{x}] [Y:{y}] [Z:{z}] | Coord:Absolute"
         line2 = f"Tool:{tool_str} | Air:{air_str} | Paint:{paint_str} | Limits:{limits}"
         line3 = f"System: [{conn_label}] [Vin {vin} V] [MCU Temp: {mcu_temp} C] [{driver_label}]"
@@ -357,6 +370,14 @@ class AirbrushTextualApp(App):
                 return
             if cmd in ("exit", "quit"):
                 self.exit()
+                return
+            # Connection guard for commands that require an active transport
+            requires_connection = cmd in {
+                "home","move","tool","air","paint","dot","draw","gcode","status"
+            }
+            if requires_connection and (not self.transport or not self.transport.is_connected()):
+                if self.high_log:
+                    self.high_log.write("[error] Not connected")
                 return
             if cmd == "connect":
                 if len(rest) < 1:
@@ -475,10 +496,6 @@ class AirbrushTextualApp(App):
                     self.high_log.write("Disconnected")
                 self.call_from_thread(self._update_status)
                 return
-            if not self.transport or not self.transport.is_connected():
-                if self.high_log:
-                    self.high_log.write("[error] Not connected")
-                return
             if cmd == "home":
                 from semantic_gcode.dict.gcode_commands.G28.G28 import G28_Home
                 from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
@@ -549,7 +566,6 @@ class AirbrushTextualApp(App):
                 fan_on = 2 if tool_index == 0 else 3
                 fan_other = 3 if tool_index == 0 else 2
                 from semantic_gcode.dict.gcode_commands.M106.M106 import M106_FanControl
-                from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
                 seq = []
                 # Normalize state
                 is_on = (state is None) or (state in ("on","1","true","yes"))
@@ -569,17 +585,13 @@ class AirbrushTextualApp(App):
                     if self.high_log:
                         self.high_log.write("[error] air: unknown state; use on/off")
                     return
-                seq.append(M400_WaitForMoves.create())
                 if self.dispatcher:
                     for instr in seq:
                         self.dispatcher.enqueue(instr)
                 else:
                     for instr in seq:
                         s = str(instr)
-                        if s.startswith("M400"):
-                            self.transport.query(s)
-                        else:
-                            self.transport.send_line(s)
+                        self.transport.send_line(s)
                 # After enqueuing, update local observed fanPercent immediately
                 # Determine indexes again (simple re-eval)
                 tool_index = self._get_current_tool_index()
@@ -703,10 +715,7 @@ class AirbrushTextualApp(App):
                 else:
                     for instr in seq:
                         s = str(instr)
-                        if s.startswith("M400"):
-                            self.transport.query(s)
-                        else:
-                            self.transport.send_line(s)
+                        self.transport.send_line(s)
                 return
             if cmd == "draw":
                 # draw [params per commands.yaml]
@@ -796,10 +805,7 @@ class AirbrushTextualApp(App):
                 else:
                     for instr in seq:
                         s = str(instr)
-                        if s.startswith("M400"):
-                            self.transport.query(s)
-                        else:
-                            self.transport.send_line(s)
+                        self.transport.send_line(s)
                 return
             if cmd == "ip":
                 # Auto-connect to serial and query IP (M552)
@@ -1010,6 +1016,7 @@ class AirbrushTextualApp(App):
             instr = (ev.instruction or "").strip()
             if instr.startswith("M408"):
                 self._update_status()
+                self._last_status_ts = time.time()
                 return
             msg = "OK" if ev.ok else (ev.message or "Timeout")
             if self.high_log:
@@ -1022,4 +1029,5 @@ class AirbrushTextualApp(App):
             return
         if isinstance(ev, StateUpdatedEvent):
             self._update_status()
+            self._last_status_ts = time.time()
             return 
