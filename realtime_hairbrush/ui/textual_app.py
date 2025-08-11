@@ -298,7 +298,12 @@ class AirbrushTextualApp(App):
             or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("xyz")
             or obs.get("raw_status", {}).get("raw", {}).get("position")
         )
-        homed_list = obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
+        # Homing info can be provided as coords.axesHomed (M408 S2) or homed (M408 S0)
+        homed_list = (
+            obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed")
+            or obs.get("raw_status", {}).get("raw", {}).get("homed")
+            or []
+        )
         def is_homed_xyz() -> bool:
             try:
                 return bool(int(homed_list[0])) and bool(int(homed_list[1])) and bool(int(homed_list[2]))
@@ -1279,8 +1284,8 @@ class AirbrushTextualApp(App):
                 except Exception:
                     pass
                 # Do not return; fall through to log ack as usual
-            # For all other acks (non-status commands), trigger a one-shot M408 refresh
-            if instr and (not instr.startswith("M409")) and (not instr.startswith("M400")):
+            # For all other acks (non-status commands), refresh only if agent is not active
+            if (not self._agent) and instr and (not instr.startswith("M409")) and (not instr.startswith("M400")):
                 try:
                     self._refresh_status_once()
                     self._last_status_ts = time.time()

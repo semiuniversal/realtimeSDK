@@ -102,9 +102,58 @@ class ObjectModelAgent:
         if not self._transport or not self._transport.is_connected():
             return
         try:
-            # Query full object model (M408 S2) and parse JSON directly for consistency
-            line = "M408 S2"
-            resp = await asyncio.to_thread(self._transport.query, line)
+            # Prefer compact M408 S0 to populate homed[] and quick status
+            line0 = "M408 S0"
+            resp0 = await asyncio.to_thread(self._transport.query, line0)
+            data0 = None
+            if resp0:
+                try:
+                    import json
+                    t0 = resp0.strip()
+                    if "{" in t0 and "}" in t0:
+                        t0 = t0[t0.find("{") : t0.rfind("}") + 1]
+                    data0 = json.loads(t0) if t0 else None
+                except Exception:
+                    data0 = None
+            # Optionally follow with S2 for fuller object model
+            data2 = None
+            try:
+                line2 = "M408 S2"
+                resp2 = await asyncio.to_thread(self._transport.query, line2)
+                if resp2:
+                    import json
+                    t2 = resp2.strip()
+                    if "{" in t2 and "}" in t2:
+                        t2 = t2[t2.find("{") : t2.rfind("}") + 1]
+                    data2 = json.loads(t2)
+            except Exception:
+                data2 = None
+            merged_raw = {}
+            if isinstance(data2, dict):
+                merged_raw = data2
+            if isinstance(data0, dict):
+                # data0 may include keys like homed[] and machine[]
+                merged_raw = {**merged_raw, **data0}
+            if not merged_raw:
+                return
+            patch = {"raw_status": {"raw": merged_raw}, "firmware": {"status": (data0 or data2 or {}).get("status")}}
+            self._emit_patch(patch)
+            # Ensure homed[] present using M409 if missing
+            try:
+                if not isinstance(merged_raw.get("homed"), list):
+                    await self._refresh_homed()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    async def _refresh_homed(self) -> None:
+        if not self._transport or not self._transport.is_connected():
+            return
+        try:
+            from semantic_gcode.dict.gcode_commands.M409.M409 import M409_QueryObjectModel
+            cmd = M409_QueryObjectModel.create(path='move.axes[].homed', s=2)
+            resp = await asyncio.wait_for(asyncio.to_thread(self._transport.query, str(cmd)), timeout=0.8)
             if not resp:
                 return
             import json
@@ -112,10 +161,9 @@ class ObjectModelAgent:
             if "{" in txt and "}" in txt:
                 txt = txt[txt.find("{") : txt.rfind("}") + 1]
             data = json.loads(txt)
-            if not isinstance(data, dict):
-                return
-            patch = {"raw_status": {"raw": data}, "firmware": {"status": data.get("status")}}
-            self._emit_patch(patch)
+            result = data.get("result") if isinstance(data, dict) else None
+            if isinstance(result, list) and result:
+                self._emit_patch({"raw_status": {"raw": {"homed": result}}})
         except Exception:
             pass
 

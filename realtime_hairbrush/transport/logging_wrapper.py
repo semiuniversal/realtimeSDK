@@ -69,6 +69,21 @@ def _ensure_log_fresh() -> str:
         return log_path
 
 
+_log_write_lock = threading.Lock()
+
+def log_note(text: str) -> None:
+    """Append a diagnostic NOTE line to the session log."""
+    try:
+        path = _ensure_log_fresh()
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        line = f"[{ts}.{int((time.time()%1)*1000):03d}] NOTE {text}\n"
+        with _log_write_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
 class LoggingTransport(Transport):
     """
     Decorator for Transport that logs all TX/RX to a file.
@@ -130,11 +145,12 @@ class LoggingTransport(Transport):
             raise
 
     def query(self, query_cmd: str) -> Optional[str]:
-        # Log the intent (even empty string reads)
+        # Short-circuit empty queries to avoid logging churn
+        if not query_cmd or not str(query_cmd).strip():
+            return None
         self._log("Q", (query_cmd if query_cmd else "<empty>").replace("\n", "\\n"))
         try:
             resp = self.inner.query(query_cmd)
-            # Log possibly large responses in a compact single line
             txt = (resp or "").replace("\n", " ").strip()
             self._log("R", txt if txt else "<none>")
             return resp

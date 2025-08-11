@@ -174,6 +174,16 @@ class AirbrushTransport:
             self._last_error = str(e)
             return None
 
+    def read_reply(self) -> Optional[str]:
+        """HTTP-only helper to fetch rr_reply without sending a new command."""
+        try:
+            inner = self.transport
+            if isinstance(inner, HttpTransport):
+                return inner.read_reply()
+        except Exception:
+            pass
+        return None
+
     def get_status(self) -> Dict[str, Any]:
         """
         Get the current status of the device.

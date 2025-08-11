@@ -109,10 +109,20 @@ class Dispatcher:
                     first = self.transport.query(line)
                     if first:
                         self._emit(ReceivedEvent(line=first))
-                    # Immediately send token via M118
-                    tok_line = f'M118 S"{tag}"'
+                    # Immediately send token via M118 (using semantic class if available)
+                    try:
+                        from semantic_gcode.dict.gcode_commands.M118.M118 import M118_SendMessage
+                        tok_line = str(M118_SendMessage.create(message=tag))
+                    except Exception:
+                        tok_line = f'M118 S"{tag}"'
                     self._emit(SentEvent(line=tok_line))
                     _ = self.transport.query(tok_line)
+                    # Log the tag to the session log for correlation
+                    try:
+                        from ..transport.logging_wrapper import log_note
+                        log_note(f"TAG {tag} for {line}")
+                    except Exception:
+                        pass
                 except Exception:
                     try:
                         last_err = self.transport.get_last_error()
@@ -134,16 +144,15 @@ class Dispatcher:
                     resp = None
                     try:
                         if is_http:
-                            # type: ignore[attr-defined]
-                            resp = getattr(self.transport.transport, "read_reply", None)() if hasattr(self.transport, "transport") else None
-                            if resp is None:
-                                # Fallback: try rr_reply via underlying http instance
-                                from semantic_gcode.transport.http import HttpTransport
-                                inner = getattr(self.transport, "transport", None)
-                                if isinstance(inner, HttpTransport):
-                                    resp = inner.read_reply()
+                            # Try rr_reply first (no command sent)
+                            inner = getattr(self.transport, "transport", None)
+                            try:
+                                resp = inner.read_reply() if hasattr(inner, "read_reply") else None
+                            except Exception:
+                                resp = None
                         if resp is None:
-                            resp = self.transport.query("M408 S0")  # light probe to flush message queue
+                            # As a last resort, do not send empty queries; use a controlled light probe
+                            resp = self.transport.query("M408 S0")
                     except Exception:
                         resp = None
                     if resp:
