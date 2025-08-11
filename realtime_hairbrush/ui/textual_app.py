@@ -61,6 +61,7 @@ class AirbrushTextualApp(App):
         self._motion_refresh_timer = None
         self._motion_refresh_inflight: bool = False
         self._last_machine_pos = None
+        self._move_timeout_prev: Optional[float] = None
         # Command history
         self._history: list[str] = []
         self._hist_pos: Optional[int] = None
@@ -556,6 +557,7 @@ class AirbrushTextualApp(App):
                         self.high_log.write("[error] move requires at least one of x, y, z")
                     return
                 from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
+                from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
                 # If Z not provided, include current Z from object model to send a full X/Y/Z triple
                 if z is None:
                     try:
@@ -575,10 +577,44 @@ class AirbrushTextualApp(App):
                 if z is not None: params['z'] = z
                 if f is not None: params['feedrate'] = f
                 g1 = G1_LinearMove.create(**params)
+                # Compute a rough ETA to set a safe timeout for M400 (HTTP/macOS often delays acks)
+                eta_s = 10.0
+                try:
+                    # Current pos (fallback zeros)
+                    cur = [0.0, 0.0, 0.0]
+                    snap = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {})
+                    pos = (
+                        snap.get("coords", {}).get("machine")
+                        or snap.get("coords", {}).get("xyz")
+                        or snap.get("position")
+                    )
+                    if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                        cur = [float(pos[0] or 0), float(pos[1] or 0), float(pos[2] or 0)]
+                    tgt = [cur[0] if x is None else x, cur[1] if y is None else y, cur[2] if z is None else z]
+                    dx = (tgt[0] - cur[0])
+                    dy = (tgt[1] - cur[1])
+                    dz = (tgt[2] - cur[2])
+                    dist = (dx*dx + dy*dy + dz*dz) ** 0.5
+                    speed = f if f is not None else 50.0  # assume mm/s if not provided
+                    if speed <= 0:
+                        speed = 10.0
+                    eta_s = max(5.0, min(120.0, dist / speed * 1.5 + 3.0))
+                except Exception:
+                    eta_s = 15.0
+                # Temporarily raise transport timeout for the upcoming M400
+                try:
+                    self._move_timeout_prev = getattr(self.transport.config, 'timeout', None)
+                    if self._move_timeout_prev is None or self._move_timeout_prev < eta_s:
+                        self.transport.config.timeout = float(eta_s)
+                except Exception:
+                    pass
+                m400 = M400_WaitForMoves.create()
                 if self.dispatcher:
                     self.dispatcher.enqueue(g1)
+                    self.dispatcher.enqueue(m400)
                 else:
                     self.transport.send_line(str(g1))
+                    self.transport.query(str(m400))
                 # Do not immediately set predictive final pos in status bar; rely on observed polling
                 return
             if cmd == "tool":
@@ -1110,6 +1146,13 @@ class AirbrushTextualApp(App):
                     pass
                 self._refresh_status_once()
                 self._last_status_ts = time.time()
+                # Restore prior transport timeout after gated motion completes
+                try:
+                    if self._move_timeout_prev is not None:
+                        self.transport.config.timeout = self._move_timeout_prev
+                        self._move_timeout_prev = None
+                except Exception:
+                    pass
                 # Do not return; fall through to log ack as usual
             # For all other acks (non-status commands), trigger a one-shot M408 refresh
             if instr and (not instr.startswith("M409")) and (not instr.startswith("M400")):
