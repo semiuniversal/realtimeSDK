@@ -48,6 +48,8 @@ class AirbrushTextualApp(App):
         self._listener_attached = False
         # Verbosity (OFF by default to suppress polling spam)
         self._verbose: bool = False
+        # Track whether last sent line was an M408 (to suppress its 'ok' when verbose OFF)
+        self._last_sent_was_m408: bool = False
         # Command history
         self._history: list[str] = []
         self._hist_pos: Optional[int] = None
@@ -812,35 +814,88 @@ class AirbrushTextualApp(App):
                             if self.high_log:
                                 self.high_log.write(f"[error] connect failed: {self.transport.get_last_error()}")
                             return
-                    # Query IP
-                    try:
-                        from semantic_gcode.dict.gcode_commands.M552.M552 import M552_NetworkControl
-                        m552 = M552_NetworkControl.create()
-                        resp = self.transport.query(str(m552))
-                    except Exception:
-                        resp = self.transport.query("M552")
+                    # Try to read IP from current object model first
                     ip = None
-                    if resp:
-                        # Robustly extract the first IPv4 address anywhere in the response
+                    try:
+                        snap = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {})
+                        # Heuristic: find any IPv4-like value under 'network'
+                        import re
+                        def find_ipv4(obj):
+                            if isinstance(obj, dict):
+                                for v in obj.values():
+                                    r = find_ipv4(v)
+                                    if r:
+                                        return r
+                            elif isinstance(obj, list):
+                                for v in obj:
+                                    r = find_ipv4(v)
+                                    if r:
+                                        return r
+                            elif isinstance(obj, str):
+                                m = re.search(r"(\d{1,3}\.){3}\d{1,3}", obj)
+                                if m:
+                                    return m.group(0)
+                            return None
+                        ip = find_ipv4(snap.get("network"))
+                    except Exception:
+                        ip = None
+                    # If not found, force one-shot status and try again
+                    if not ip:
+                        self._refresh_status_once()
                         try:
+                            snap = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {})
                             import re
-                            m = re.search(r"(\d{1,3}\.){3}\d{1,3}", resp)
-                            if m:
-                                ip = m.group(0)
+                            def find_ipv4(obj):
+                                if isinstance(obj, dict):
+                                    for v in obj.values():
+                                        r = find_ipv4(v)
+                                        if r:
+                                            return r
+                                elif isinstance(obj, list):
+                                    for v in obj:
+                                        r = find_ipv4(v)
+                                        if r:
+                                            return r
+                                elif isinstance(obj, str):
+                                    m = re.search(r"(\d{1,3}\.){3}\d{1,3}", obj)
+                                    if m:
+                                        return m.group(0)
+                                return None
+                            ip = find_ipv4(snap.get("network"))
                         except Exception:
                             ip = None
-                        if not ip:
-                            # Fallback legacy parsing for lines containing 'IP address'
-                            for ln in resp.splitlines():
-                                ln = ln.strip()
-                                if "IP address" in ln:
-                                    parts = ln.replace('=', ' ').replace(':', ' ').split()
-                                    # take last token and strip punctuation
-                                    if parts:
-                                        cand = parts[-1].strip().strip('.,;')
-                                        if re.match(r"(\d{1,3}\.){3}\d{1,3}", cand):
-                                            ip = cand
-                                            break
+                    # Query IP via M552 if still unknown
+                    if not ip:
+                        try:
+                            from semantic_gcode.dict.gcode_commands.M552.M552 import M552_NetworkControl
+                            m552 = M552_NetworkControl.create()
+                            line = str(m552)
+                        except Exception:
+                            line = "M552"
+                        if self.gcode_log:
+                            self.gcode_log.write(escape(f"→ {line}"))
+                        resp = self.transport.query(line)
+                        if resp and self.gcode_log:
+                            self.gcode_log.write(escape(f"← {resp.strip()}"))
+                        if resp:
+                            # Robustly extract IPv4 in response
+                            try:
+                                import re
+                                m = re.search(r"(\d{1,3}\.){3}\d{1,3}", resp)
+                                if m:
+                                    ip = m.group(0)
+                            except Exception:
+                                ip = None
+                            if not ip:
+                                for ln in resp.splitlines():
+                                    ln = ln.strip()
+                                    if "IP address" in ln:
+                                        parts = ln.replace('=', ' ').replace(':', ' ').split()
+                                        if parts:
+                                            cand = parts[-1].strip().strip('.,;')
+                                            if re.match(r"(\d{1,3}\.){3}\d{1,3}", cand):
+                                                ip = cand
+                                                break
                     if self.high_log:
                         self.high_log.write(f"IP: {ip or 'unknown'}")
                 except Exception as e:
@@ -856,6 +911,8 @@ class AirbrushTextualApp(App):
                 # Send raw line(s) split by ';' or comma
                 lines = [seg.strip() for seg in raw.replace(',', ';').split(';') if seg.strip()]
                 for line in lines:
+                    if self.gcode_log:
+                        self.gcode_log.write(escape(f"→ {line}"))
                     if self.dispatcher:
                         # Minimal: send via transport; dispatcher still logs
                         self.transport.send_line(line)
@@ -905,7 +962,8 @@ class AirbrushTextualApp(App):
         if isinstance(ev, SentEvent):
             if self.gcode_log:
                 line = (ev.line or "")
-                if (not self._verbose) and line.strip().startswith("M408"):
+                self._last_sent_was_m408 = line.strip().startswith("M408")
+                if (not self._verbose) and self._last_sent_was_m408:
                     return
                 self.gcode_log.write(escape(f"→ {line}"))
             return
@@ -916,6 +974,9 @@ class AirbrushTextualApp(App):
                     return
                 # Suppress object-model JSON when verbose is OFF
                 if (not self._verbose) and (txt.startswith("{") or '"status"' in txt):
+                    return
+                # Suppress 'ok' only for M408 when verbose is OFF
+                if (not self._verbose) and self._last_sent_was_m408 and txt.lower() == 'ok':
                     return
                 # If JSON substring exists, compress to one line
                 if "{" in txt and "}" in txt:
