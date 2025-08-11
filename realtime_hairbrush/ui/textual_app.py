@@ -57,6 +57,8 @@ class AirbrushTextualApp(App):
         self._ip_wait_result: Optional[str] = None
         # Track last time we saw a status update to detect stale connection
         self._last_status_ts: float = 0.0
+        # Temporary motion refresh timer (Textual timer) to boost status during moves
+        self._motion_refresh_timer = None
         # Command history
         self._history: list[str] = []
         self._hist_pos: Optional[int] = None
@@ -1029,6 +1031,19 @@ class AirbrushTextualApp(App):
                 if (not self._verbose) and self._last_sent_was_m408:
                     return
                 self.gcode_log.write(escape(f"→ {line}"))
+            # If a motion or home command is sent, start a temporary fast refresh
+            try:
+                ln = (ev.line or "").strip()
+                if ln.startswith("G1") or ln.startswith("G28"):
+                    # Start/replace a 0.5s interval to refresh status while in motion
+                    if self._motion_refresh_timer is not None:
+                        try:
+                            self._motion_refresh_timer.cancel()
+                        except Exception:
+                            pass
+                    self._motion_refresh_timer = self.set_interval(0.5, self._refresh_status_once)
+            except Exception:
+                pass
             return
         if isinstance(ev, ReceivedEvent):
             if self.gcode_log:
@@ -1073,6 +1088,17 @@ class AirbrushTextualApp(App):
                 self._update_status()
                 self._last_status_ts = time.time()
                 return
+            # On M400 (end of motion), force a one-shot immediate status refresh and stop motion timer
+            if instr.startswith("M400"):
+                try:
+                    if self._motion_refresh_timer is not None:
+                        self._motion_refresh_timer.cancel()
+                        self._motion_refresh_timer = None
+                except Exception:
+                    pass
+                self._refresh_status_once()
+                self._last_status_ts = time.time()
+                # Do not return; fall through to log ack as usual
             msg = "OK" if ev.ok else (ev.message or "Timeout")
             if self.high_log:
                 self.high_log.write(f"Ack: {msg}")
