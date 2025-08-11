@@ -242,10 +242,13 @@ class AirbrushTextualApp(App):
             "busy": "Busy",
             "idle": "Idle",
         }.get(fw_status, fw_status or "?")
-        # Consider status stale if no update in > 6s (3x 2s polling) and mark as not connected for UI
-        is_stale = (time.time() - self._last_status_ts) > 6.0 if self._last_status_ts > 0 else False
-        if (not connected) or is_stale:
-            label = "Not Connected"
+        # Keep last known label if unknown
+        if not hasattr(self, "_last_status_label"):
+            self._last_status_label = label
+        if label == "?":
+            label = self._last_status_label
+        else:
+            self._last_status_label = label
         # Use live machine position for in-flight updates; xyz is the commanded/target position
         pos = (
             obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("machine")
@@ -282,7 +285,6 @@ class AirbrushTextualApp(App):
                 return "-"
         limits = f"[X:{flag(0)}] [Y:{flag(1)}] [Z:{flag(2)}] [U:{flag(3)}] [V:{flag(4)}]"
         diag = obs.get("diagnostics", {})
-        # Try diagnostics; fall back to params.atxPower for VIN if present
         vin = diag.get("vin")
         if vin is None:
             vin = obs.get("raw_status", {}).get("raw", {}).get("params", {}).get("atxPower")
@@ -293,12 +295,13 @@ class AirbrushTextualApp(App):
         driver_label = f"Driver temp: {'WARNING' if overtemp else driver_temp}"
         ends = obs.get("endstops", {})
         ends_list = " ".join([f"{k}:{'1' if v else '0'}" for k, v in ends.items()]) if ends else ""
-        if (not connected) or is_stale:
+        if not connected:
             conn_label = "Not Connected"
         else:
             conn_label = f"Serial:{host}" if (mode == "serial") else (f"HTTP:{host}" if mode == "http" else "-:-")
         line1 = f"Status:{label} | ToolPos[X:{x}] [Y:{y}] [Z:{z}] | Coord:Absolute"
         line2 = f"Tool:{tool_str} | Air:{air_str} | Paint:{paint_str} | Limits:{limits}"
+        # Place Not Connected at the start of System line before Vin
         line3 = f"System: [{conn_label}] [Vin {vin} V] [MCU Temp: {mcu_temp} C] [{driver_label}]"
         if ends_list:
             line3 += f" [Endstops: {ends_list}]"
@@ -541,6 +544,7 @@ class AirbrushTextualApp(App):
                     self.transport.query(str(m400))
                 return
             if cmd == "move":
+                # move x.. y.. [z..] [f..]
                 kv = {p[0].lower(): p[1:] for p in rest if len(p) >= 2 and p[0].lower() in ("x","y","z","f") and p[1:].replace('.', '', 1).replace('-', '', 1).isdigit()}
                 x = float(kv['x']) if 'x' in kv else None
                 y = float(kv['y']) if 'y' in kv else None
@@ -551,6 +555,19 @@ class AirbrushTextualApp(App):
                         self.high_log.write("[error] move requires at least one of x, y, z")
                     return
                 from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
+                # If Z not provided, include current Z from object model to send a full X/Y/Z triple
+                if z is None:
+                    try:
+                        snap = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {})
+                        pos = (
+                            snap.get("coords", {}).get("machine")
+                            or snap.get("coords", {}).get("xyz")
+                            or snap.get("position")
+                        )
+                        if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                            z = float(pos[2])
+                    except Exception:
+                        z = z
                 params = {}
                 if x is not None: params['x'] = x
                 if y is not None: params['y'] = y
@@ -1124,10 +1141,10 @@ class AirbrushTextualApp(App):
         try:
             try:
                 from semantic_gcode.dict.gcode_commands.M409.M409 import M409_QueryObjectModel
-                cmd = M409_QueryObjectModel.create(path='coords.machine')
+                cmd = M409_QueryObjectModel.create(path='move.axes[].machinePosition', s=2)
                 resp = self.transport.query(str(cmd))
             except Exception:
-                resp = self.transport.query('M409 K"coords.machine"')
+                resp = self.transport.query('M409 K"move.axes[].machinePosition"')
             if not resp:
                 return
             # Parse JSON and update only the coords.machine part of observed
@@ -1139,8 +1156,8 @@ class AirbrushTextualApp(App):
                 obj = json.loads(txt)
             except Exception:
                 obj = {}
-            coords = (obj.get('coords') or {}) if isinstance(obj, dict) else {}
-            machine = coords.get('machine') if isinstance(coords, dict) else None
+            result = obj.get('result') if isinstance(obj, dict) else None
+            machine = result if isinstance(result, (list, tuple)) else None
             if isinstance(machine, (list, tuple)):
                 # Merge minimally to the raw_status branch used by status bar
                 self._merge_observed_patch({

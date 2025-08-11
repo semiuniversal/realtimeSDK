@@ -17,18 +17,22 @@ from semantic_gcode.gcode.mixins import ExpectsAcknowledgement
 class M409_QueryObjectModel(GCodeInstruction, ExpectsAcknowledgement):
     """M409: Query object model.
 
-    Minimal support for K"path" queries. Example:
-      M409 K"coords.machine"  -> {"coords":{"machine":[x,y,z,...]}}
+    Minimal support for K"path" queries with optional S level. Example:
+      M409 K"coords.machine" S2  -> {"key":"coords.machine","result":{"coords":{"machine":[...]}}}
+      M409 K"move.axes[].machinePosition" S2 -> {"key":"...","result":[...]} (positions list)
     """
 
     code_type = "M"
     code_number = 409
-    valid_parameters: list[str] = ["K"]
+    valid_parameters: list[str] = ["K", "S"]
 
     @classmethod
-    def create(cls, path: str) -> "M409_QueryObjectModel":
-        # Ensure path is a string without surrounding quotes; the base class will render
-        params = {"K": path}
+    def create(cls, path: str, s: Optional[int] = 2) -> "M409_QueryObjectModel":
+        # Quote the K path explicitly; include S level if provided
+        quoted = f'"{path}"'
+        params: Dict[str, object] = {"K": quoted}
+        if s is not None:
+            params["S"] = int(s)
         return cls(code_type="M", code_number=409, parameters=params, comment="Query object model")
 
     def parse_json(self, response: str) -> Dict[str, Any]:
