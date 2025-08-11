@@ -817,14 +817,26 @@ class AirbrushTextualApp(App):
                         resp = self.transport.query("M552")
                     ip = None
                     if resp:
-                        for ln in resp.splitlines():
-                            ln = ln.strip()
-                            if "IP address" in ln:
-                                # e.g., IP address = 192.168.1.100
-                                parts = ln.replace('=', ' ').split()
-                                if parts:
-                                    ip = parts[-1]
-                                    break
+                        # Robustly extract the first IPv4 address anywhere in the response
+                        try:
+                            import re
+                            m = re.search(r"(\d{1,3}\.){3}\d{1,3}", resp)
+                            if m:
+                                ip = m.group(0)
+                        except Exception:
+                            ip = None
+                        if not ip:
+                            # Fallback legacy parsing for lines containing 'IP address'
+                            for ln in resp.splitlines():
+                                ln = ln.strip()
+                                if "IP address" in ln:
+                                    parts = ln.replace('=', ' ').replace(':', ' ').split()
+                                    # take last token and strip punctuation
+                                    if parts:
+                                        cand = parts[-1].strip().strip('.,;')
+                                        if re.match(r"(\d{1,3}\.){3}\d{1,3}", cand):
+                                            ip = cand
+                                            break
                     if self.high_log:
                         self.high_log.write(f"IP: {ip or 'unknown'}")
                 except Exception as e:
