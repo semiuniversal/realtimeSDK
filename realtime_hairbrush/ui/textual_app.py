@@ -59,6 +59,7 @@ class AirbrushTextualApp(App):
         self._last_status_ts: float = 0.0
         # Temporary motion refresh timer (Textual timer) to boost status during moves
         self._motion_refresh_timer = None
+        self._motion_refresh_inflight: bool = False
         # Command history
         self._history: list[str] = []
         self._hist_pos: Optional[int] = None
@@ -94,11 +95,6 @@ class AirbrushTextualApp(App):
         if self.dispatcher and not self._listener_attached:
             self.dispatcher.on_event(lambda ev: self.call_from_thread(self._handle_event, ev))
             self._listener_attached = True
-        if self.transport and self.transport.is_connected() and not self.poller:
-            # Global poll interval: slower (2.0s) to reduce contention on all transports
-            poll_interval = 2.0
-            self.poller = StatusPoller(self.transport, self.state, emit=self._emit_event_safe, interval=poll_interval)
-            self.poller.start()
         # force an immediate status render tick while first poll is in-flight
         self._update_status()
         self.set_interval(0.5, self._update_status)
@@ -470,13 +466,11 @@ class AirbrushTextualApp(App):
                     if self.high_log:
                         self.high_log.write(f"[error] connect failed: {self.transport.get_last_error()}")
                     return
-                # Create fresh dispatcher/poller
+                # Create fresh dispatcher (no periodic poller; status is on-demand)
                 self.dispatcher = Dispatcher(self.transport, self.state)
                 self.dispatcher.on_event(lambda ev: self.call_from_thread(self._handle_event, ev))
                 self.dispatcher.start()
                 self._listener_attached = True
-                self.poller = StatusPoller(self.transport, self.state, emit=self._emit_event_safe, interval=2.0)
-                self.poller.start()
                 # Immediately fetch full status once on connect
                 try:
                     self._refresh_status_once()
@@ -1041,7 +1035,7 @@ class AirbrushTextualApp(App):
                             self._motion_refresh_timer.cancel()
                         except Exception:
                             pass
-                    self._motion_refresh_timer = self.set_interval(0.5, self._refresh_status_once)
+                    self._motion_refresh_timer = self.set_interval(0.25, self._refresh_coords_machine)
             except Exception:
                 pass
             return
@@ -1099,6 +1093,13 @@ class AirbrushTextualApp(App):
                 self._refresh_status_once()
                 self._last_status_ts = time.time()
                 # Do not return; fall through to log ack as usual
+            # For all other acks (non-status commands), trigger a one-shot M408 refresh
+            if instr and (not instr.startswith("M409")) and (not instr.startswith("M400")):
+                try:
+                    self._refresh_status_once()
+                    self._last_status_ts = time.time()
+                except Exception:
+                    pass
             msg = "OK" if ev.ok else (ev.message or "Timeout")
             if self.high_log:
                 self.high_log.write(f"Ack: {msg}")
@@ -1112,3 +1113,39 @@ class AirbrushTextualApp(App):
             self._update_status()
             self._last_status_ts = time.time()
             return 
+
+    def _refresh_coords_machine(self) -> None:
+        # Latest-only, non-overlapping M409 K"coords.machine" refresh for live positions during motion
+        if self._motion_refresh_inflight:
+            return
+        if not self.transport or not self.transport.is_connected():
+            return
+        self._motion_refresh_inflight = True
+        try:
+            try:
+                from semantic_gcode.dict.gcode_commands.M409.M409 import M409_QueryObjectModel
+                cmd = M409_QueryObjectModel.create(path='coords.machine')
+                resp = self.transport.query(str(cmd))
+            except Exception:
+                resp = self.transport.query('M409 K"coords.machine"')
+            if not resp:
+                return
+            # Parse JSON and update only the coords.machine part of observed
+            try:
+                import json
+                txt = resp.strip()
+                if "{" in txt and "}" in txt:
+                    txt = txt[txt.find("{") : txt.rfind("}") + 1]
+                obj = json.loads(txt)
+            except Exception:
+                obj = {}
+            coords = (obj.get('coords') or {}) if isinstance(obj, dict) else {}
+            machine = coords.get('machine') if isinstance(coords, dict) else None
+            if isinstance(machine, (list, tuple)):
+                # Merge minimally to the raw_status branch used by status bar
+                self._merge_observed_patch({
+                    'raw_status': {'raw': {'coords': {'machine': machine}}}
+                })
+                self._last_status_ts = time.time()
+        finally:
+            self._motion_refresh_inflight = False 
