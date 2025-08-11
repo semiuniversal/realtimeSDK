@@ -60,6 +60,7 @@ class AirbrushTextualApp(App):
         # Temporary motion refresh timer (Textual timer) to boost status during moves
         self._motion_refresh_timer = None
         self._motion_refresh_inflight: bool = False
+        self._last_machine_pos = None
         # Command history
         self._history: list[str] = []
         self._hist_pos: Optional[int] = None
@@ -1139,13 +1140,32 @@ class AirbrushTextualApp(App):
             return
         self._motion_refresh_inflight = True
         try:
+            start_ts = time.time()
+            # Short per-request timeout (best-effort) to avoid late, bursty updates
+            old_timeout = None
+            try:
+                old_timeout = getattr(self.transport.config, 'timeout', None)
+                if old_timeout is not None and old_timeout > 0.8:
+                    self.transport.config.timeout = 0.8
+            except Exception:
+                pass
             try:
                 from semantic_gcode.dict.gcode_commands.M409.M409 import M409_QueryObjectModel
                 cmd = M409_QueryObjectModel.create(path='move.axes[].machinePosition', s=2)
                 resp = self.transport.query(str(cmd))
             except Exception:
                 resp = self.transport.query('M409 K"move.axes[].machinePosition"')
+            finally:
+                # Restore timeout
+                try:
+                    if old_timeout is not None:
+                        self.transport.config.timeout = old_timeout
+                except Exception:
+                    pass
             if not resp:
+                return
+            # Drop stale responses (arrived too late)
+            if (time.time() - start_ts) > 1.0:
                 return
             # Parse JSON and update only the coords.machine part of observed
             try:
@@ -1159,10 +1179,21 @@ class AirbrushTextualApp(App):
             result = obj.get('result') if isinstance(obj, dict) else None
             machine = result if isinstance(result, (list, tuple)) else None
             if isinstance(machine, (list, tuple)):
+                # Debounce unchanged values (within a small epsilon)
+                try:
+                    if isinstance(self._last_machine_pos, (list, tuple)) and len(self._last_machine_pos) >= 3 and len(machine) >= 3:
+                        eps = 1e-3
+                        if (abs(float(machine[0]) - float(self._last_machine_pos[0])) < eps and
+                            abs(float(machine[1]) - float(self._last_machine_pos[1])) < eps and
+                            abs(float(machine[2]) - float(self._last_machine_pos[2])) < eps):
+                            return
+                except Exception:
+                    pass
                 # Merge minimally to the raw_status branch used by status bar
                 self._merge_observed_patch({
                     'raw_status': {'raw': {'coords': {'machine': machine}}}
                 })
+                self._last_machine_pos = list(machine)
                 self._last_status_ts = time.time()
         finally:
             self._motion_refresh_inflight = False 
