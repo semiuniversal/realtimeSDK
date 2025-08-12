@@ -186,6 +186,10 @@ class HttpTransport(Transport):
         if not self.is_connected():
             raise ConnectionError("Not connected to Duet Web Control")
         
+        # Short-circuit empty reads to avoid HTTP churn
+        if not query_cmd or not str(query_cmd).strip():
+            return None
+        
         try:
             # Send the query command
             self.send_line(query_cmd)
@@ -216,6 +220,56 @@ class HttpTransport(Transport):
             raise TimeoutError(f"Request timed out when querying: {query_cmd}")
         except RequestException as e:
             raise TransportError(f"Failed to query: {str(e)}", {"command": query_cmd})
+
+    def read_reply(self) -> Optional[str]:
+        """Fetch the current rr_reply buffer without sending a new command."""
+        if not self.is_connected():
+            raise ConnectionError("Not connected to Duet Web Control")
+        try:
+            response = self._make_request_with_retry(
+                'GET',
+                f"{self.base_url}/rr_reply",
+                timeout=self.timeout
+            )
+            if response.status_code != 200:
+                return None
+            try:
+                reply_data = response.json()
+                if isinstance(reply_data, dict) and "buff" in reply_data:
+                    return reply_data["buff"]
+                return response.text
+            except (json.JSONDecodeError, ValueError):
+                return response.text
+        except RequestException:
+            return None
+
+    def get_model(self, key: Optional[str] = None, flags: Optional[str] = None) -> Dict[str, Any]:
+        """Query rr_model with optional key and flags and return parsed JSON.
+
+        Args:
+            key: Optional object model path (e.g., "sensors.endstops[0:2].triggered")
+            flags: Optional flags string (e.g., "f" or "v")
+
+        Returns:
+            Dict[str, Any]: Parsed JSON response from rr_model
+        """
+        if not self.is_connected():
+            raise ConnectionError("Not connected to Duet Web Control")
+        try:
+            url = f"{self.base_url}/rr_model"
+            params = {}
+            if key:
+                params["key"] = key
+            if flags:
+                params["flags"] = flags
+            response = self._make_request_with_retry('GET', url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                raise TransportError(f"Failed to get rr_model: {response.status_code}")
+            return response.json()
+        except Timeout:
+            raise TimeoutError("Request timed out when getting rr_model")
+        except RequestException as e:
+            raise TransportError(f"Failed to get rr_model: {str(e)}")
     
     def get_status(self) -> Dict[str, Any]:
         """

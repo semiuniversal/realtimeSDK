@@ -60,15 +60,14 @@ class AirbrushTransport:
                 return True
                 
             if self.config.transport_type == "serial":
-                self.transport = SerialTransport(
+                base = SerialTransport(
                     port=self.config.serial_port,
-                    baud_rate=self.config.serial_baudrate,  # Changed from baudrate to baud_rate
+                    baud_rate=self.config.serial_baudrate,
                     timeout=self.config.timeout
                 )
             elif self.config.transport_type == "http":
-                # Use the correct parameter name 'url' instead of 'host'
                 url = f"http://{self.config.http_host}"
-                self.transport = HttpTransport(
+                base = HttpTransport(
                     url=url,
                     password=self.config.http_password,
                     timeout=self.config.timeout
@@ -77,11 +76,27 @@ class AirbrushTransport:
                 self._last_error = f"Unsupported transport type: {self.config.transport_type}"
                 return False
 
+            # Wrap with logging decorator if enabled (default on)
+            try:
+                from .logging_wrapper import LoggingTransport
+                # Always enable logging in this branch unless explicitly disabled
+                if os.getenv("AIRBRUSH_LOG", "1") in ("0", "false", "False"):
+                    self.transport = base
+                else:
+                    self.transport = LoggingTransport(base)
+            except Exception:
+                self.transport = base
+
             self._connected = self.transport.connect()
             if self._connected:
                 # Store the transport globally for persistence between CLI commands
                 global _global_transport
                 _global_transport = self.transport
+                # Seed observed state by requesting one snapshot immediately
+                try:
+                    _ = self.transport.query("M408 S2")
+                except Exception:
+                    pass
             else:
                 self._last_error = "Failed to connect to the Duet board"
             
@@ -158,6 +173,16 @@ class AirbrushTransport:
         except Exception as e:
             self._last_error = str(e)
             return None
+
+    def read_reply(self) -> Optional[str]:
+        """HTTP-only helper to fetch rr_reply without sending a new command."""
+        try:
+            inner = self.transport
+            if isinstance(inner, HttpTransport):
+                return inner.read_reply()
+        except Exception:
+            pass
+        return None
 
     def get_status(self) -> Dict[str, Any]:
         """

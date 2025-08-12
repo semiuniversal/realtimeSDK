@@ -1,29 +1,35 @@
 import threading
 import time
-from typing import Optional, Callable
+from typing import Optional, Callable, List
 
-from semantic_gcode.dict.gcode_commands.M408.M408 import M408_ReportObjectModel
 from .state import MachineState
 from ..transport.airbrush_transport import AirbrushTransport
-from .events import StateUpdatedEvent, SentEvent, ReceivedEvent
-from .object_model import parse_object_model
+from .events import StateUpdatedEvent
+from .sequencer import RequestSequencer, Request, Priority, RequestKind
+from .sequencer import HttpQuerySpec, SerialQuerySpec
 
 
 class StatusPoller:
-    def __init__(self, transport: AirbrushTransport, state: MachineState, emit: Optional[Callable] = None, interval: float = 1.0) -> None:
-        self.transport = transport
+    def __init__(
+        self,
+        sequencer: RequestSequencer,
+        state: MachineState,
+        emit: Optional[Callable] = None,
+        interval_fast: float = 0.5,
+        interval_medium: float = 2.5,
+        interval_slow: float = 25.0,
+    ) -> None:
+        self.sequencer = sequencer
         self.state = state
         self.emit = emit or (lambda e: None)
-        self.interval = interval
+        self.interval_fast = float(interval_fast)
+        self.interval_medium = float(interval_medium)
+        self.interval_slow = float(interval_slow)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._last_diag_ts: float = 0.0
-        self._last_endstop_ts: float = 0.0
-        # Diagnostics toggles (off by default to reduce log spam)
-        self.enable_diagnostics: bool = False
-        self.enable_endstops: bool = False
-        self.diag_period_s: float = 30.0
-        self.endstop_period_s: float = 30.0
+        self._last_fast: float = 0.0
+        self._last_medium: float = 0.0
+        self._last_slow: float = 0.0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -37,173 +43,158 @@ class StatusPoller:
         if self._thread:
             self._thread.join(timeout=1.0)
 
-    def set_diagnostics(self, enabled: bool, period_s: Optional[float] = None) -> None:
-        self.enable_diagnostics = bool(enabled)
-        if period_s is not None and period_s > 0:
-            self.diag_period_s = float(period_s)
+    def _submit_query(self, spec, priority: Priority, coalesce_key: str) -> None:
+        def on_complete(res):
+            if not res or not res.ok or res.data is None:
+                return
+            try:
+                data = res.data
+                if isinstance(spec, HttpQuerySpec):
+                    key = spec.params.get("key")
+                elif isinstance(spec, SerialQuerySpec):
+                    cmd = spec.command
+                    key = None
+                    if 'K"' in cmd or "K'" in cmd:
+                        try:
+                            # Extract key after K"..." or K'...'
+                            if 'K"' in cmd:
+                                key = cmd.split('K"', 1)[1].split('"', 1)[0]
+                            else:
+                                key = cmd.split("K'", 1)[1].split("'", 1)[0]
+                        except Exception:
+                            key = None
+                else:
+                    key = None
+                import json
+                raw = None
+                if isinstance(data, str):
+                    txt = data.strip()
+                    if "{" in txt and "}" in txt:
+                        txt = txt[txt.find("{") : txt.rfind("}") + 1]
+                    try:
+                        raw = json.loads(txt)
+                    except Exception:
+                        raw = {}
+                elif isinstance(data, dict):
+                    raw = data
+                result = raw.get("result") if isinstance(raw, dict) else None
+                patch = {"raw_status": {"raw": {}}}
+                if key == "move.axes[].userPosition" and isinstance(result, list):
+                    # Store logical/user coordinates and also mirror to coords.machine for UI compatibility
+                    patch.setdefault("coords", {})["user_position"] = result
+                    patch["raw_status"]["raw"].setdefault("coords", {})["userPosition"] = result
+                    # Mirror to legacy keys so UI shows logical coords
+                    patch["raw_status"]["raw"].setdefault("coords", {})["machine"] = result
+                elif key == "move.axes[].machinePosition" and isinstance(result, list):
+                    patch.setdefault("coords", {})["machine_position"] = result
+                    patch["raw_status"]["raw"].setdefault("coords", {})["machine"] = result
+                elif key == "state.status" and (isinstance(result, str) or result is None):
+                    patch.setdefault("firmware", {})["status"] = result
+                elif key == "move.axes[].homed" and isinstance(result, list):
+                    patch.setdefault("homed", {})["axes"] = result
+                    patch["raw_status"]["raw"].setdefault("coords", {})["axesHomed"] = result
+                elif key == "state.currentTool" and (isinstance(result, int) or result is None):
+                    patch["raw_status"]["raw"]["currentTool"] = result
+                elif key == "sensors.endstops[].triggered" and isinstance(result, list):
+                    ends = {}
+                    for idx, val in enumerate(result):
+                        try:
+                            axis = ["X","Y","Z","U","V"][idx]
+                        except Exception:
+                            axis = str(idx)
+                        ends[axis] = 1 if val else 0
+                    patch.setdefault("endstops", {}).update(ends)
+                elif key == "boards[].vIn.current" and (isinstance(result, (int, float, list))):
+                    vin = None
+                    if isinstance(result, list) and result:
+                        vin = result[0]
+                    elif isinstance(result, (int, float)):
+                        vin = result
+                    if vin is not None:
+                        patch.setdefault("diagnostics", {})["vin"] = float(vin)
+                elif key == "boards[].mcuTemp.current" and (isinstance(result, (int, float, list))):
+                    mcu = None
+                    if isinstance(result, list) and result:
+                        mcu = result[0]
+                    elif isinstance(result, (int, float)):
+                        mcu = result
+                    if mcu is not None:
+                        patch.setdefault("diagnostics", {})["mcu_temp_c"] = float(mcu)
+                if patch:
+                    snap = self.state.snapshot().get("observed", {})
+                    merged = dict(snap)
+                    def deep_merge(a, b):
+                        if not isinstance(a, dict) or not isinstance(b, dict):
+                            return b
+                        out = dict(a)
+                        for k, v in b.items():
+                            out[k] = deep_merge(out.get(k, {}), v) if isinstance(v, dict) else v
+                        return out
+                    merged = deep_merge(merged, patch)
+                    self.state.update_observed(merged)
+                    self.emit(StateUpdatedEvent(state=self.state.snapshot()))
+            except Exception:
+                return
 
-    def set_endstops(self, enabled: bool, period_s: Optional[float] = None) -> None:
-        self.enable_endstops = bool(enabled)
-        if period_s is not None and period_s > 0:
-            self.endstop_period_s = float(period_s)
+        req = Request(kind=RequestKind.QUERY, priority=priority, payload=spec, timeout_s=2.0, on_complete=on_complete)
+        req.coalesce_key = coalesce_key
+        self.sequencer.submit(req)
 
     def _run(self) -> None:
+        # Build tiered sets of queries
+        http_fast = [
+            HttpQuerySpec(endpoint="rr_model", params={"key": "move.axes[].userPosition", "flags": "f"}),
+            HttpQuerySpec(endpoint="rr_model", params={"key": "state.status", "flags": "f"}),
+            HttpQuerySpec(endpoint="rr_model", params={"key": "state.currentTool", "flags": "f"}),
+            HttpQuerySpec(endpoint="rr_model", params={"key": "sensors.endstops[].triggered", "flags": "f"}),
+        ]
+        http_medium = [
+            HttpQuerySpec(endpoint="rr_model", params={"key": "move.axes[].homed"}),
+            HttpQuerySpec(endpoint="rr_model", params={"key": "boards[].vIn.current", "flags": "f"}),
+            HttpQuerySpec(endpoint="rr_model", params={"key": "boards[].mcuTemp.current", "flags": "f"}),
+        ]
+        serial_fast = [
+            SerialQuerySpec('M409 K"move.axes[].userPosition" F"f"'),
+            SerialQuerySpec('M409 K"state.status" F"f"'),
+            SerialQuerySpec('M409 K"state.currentTool" F"f"'),
+            SerialQuerySpec('M409 K"sensors.endstops[].triggered" F"f"'),
+        ]
+        serial_medium = [
+            SerialQuerySpec('M409 K"move.axes[].homed"'),
+            SerialQuerySpec('M409 K"boards[].vIn.current" F"f"'),
+            SerialQuerySpec('M409 K"boards[].mcuTemp.current" F"f"'),
+        ]
+        # Detect if HTTP rr_model is available; if not, use serial specs directly
+        def http_available() -> bool:
+            try:
+                inner = getattr(self.sequencer.transport, 'transport', self.sequencer.transport)
+                inner2 = getattr(inner, 'transport', inner)
+                return callable(getattr(inner2, 'get_model', None))
+            except Exception:
+                return False
         while not self._stop.is_set():
             now = time.time()
-            if self.transport.is_connected():
-                # Use M408 S2 each tick for full object model
-                try:
-                    line = "M408 S2"
-                    self.emit(SentEvent(line=line))
-                    resp = self.transport.query(line)
-                    if resp:
-                        self.emit(ReceivedEvent(line=resp))
-                        try:
-                            import json
-                            text = resp.strip()
-                            if "{" in text and "}" in text:
-                                text = text[text.find("{") : text.rfind("}") + 1]
-                            data = json.loads(text)
-                        except Exception:
-                            data = {}
-                        # Merge firmware status, raw JSON, and parsed object model
-                        status = data.get("status")
-                        observed = {}
-                        if status is not None:
-                            observed["firmware"] = {"status": status}
-                        if isinstance(data, dict) and data:
-                            observed["raw_status"] = {"raw": data}
-                            # Diagnostics mapping if present in object model (M408 S2)
-                            temps = data.get("temps", {})
-                            extra = temps.get("extra") if isinstance(temps, dict) else None
-                            params = data.get("params", {})
-                            diag = {}
-                            # VIN
-                            atx = params.get("atxPower") if isinstance(params, dict) else None
-                            if isinstance(atx, (int, float)) and atx >= 0:
-                                diag["vin"] = float(atx)
-                            # MCU/driver temps if exposed in extra
-                            if isinstance(extra, list) and extra:
-                                for item in extra:
-                                    if isinstance(item, list) and len(item) >= 2 and isinstance(item[1], (int, float)):
-                                        label = str(item[0]).lower()
-                                        if "mcu" in label or "cpu" in label:
-                                            diag["mcu_temp_c"] = float(item[1])
-                                        if "driver" in label or "stepper" in label:
-                                            diag["driver_temp_c"] = float(item[1])
-                            if diag:
-                                snap = self.state.snapshot().get("observed", {})
-                                merged = dict(snap)
-                                merged.setdefault("diagnostics", {}).update(diag)
-                                self.state.update_observed(merged)
-                        model = parse_object_model(data) if isinstance(data, dict) else {}
-                        if model:
-                            observed["object_model"] = model
-                        if observed:
-                            self.state.update_observed(observed)
-                            self.emit(StateUpdatedEvent(state=self.state.snapshot()))
-                except Exception:
-                    pass
-                # Diagnostics (M122) gated and throttled
-                if self.enable_diagnostics and (now - self._last_diag_ts > self.diag_period_s):
-                    try:
-                        try:
-                            from semantic_gcode.dict.gcode_commands.M122.M122 import M122_Diagnostics
-                            m122 = M122_Diagnostics.create()
-                            line = str(m122)
-                        except Exception:
-                            line = "M122"
-                        self.emit(SentEvent(line=line))
-                        resp = self.transport.query(line)
-                        if resp:
-                            self.emit(ReceivedEvent(line=resp))
-                            try:
-                                diag = m122.parse_diagnostics(resp) if 'm122' in locals() else {}
-                            except Exception:
-                                diag = {}
-                            if diag:
-                                snap = self.state.snapshot().get("observed", {})
-                                merged = dict(snap)
-                                merged.setdefault("diagnostics", {}).update(diag)
-                                self.state.update_observed(merged)
-                                self.emit(StateUpdatedEvent(state=self.state.snapshot()))
-                    except Exception:
-                        pass
-                    self._last_diag_ts = now
-                # Endstops (M119) gated and throttled
-                if self.enable_endstops and (now - self._last_endstop_ts > self.endstop_period_s):
-                    try:
-                        try:
-                            from semantic_gcode.dict.gcode_commands.M119.M119 import M119_EndstopStatus
-                            m119 = M119_EndstopStatus.create()
-                            line = str(m119)
-                        except Exception:
-                            line = "M119"
-                        self.emit(SentEvent(line=line))
-                        resp = self.transport.query(line)
-                        if resp:
-                            self.emit(ReceivedEvent(line=resp))
-                            try:
-                                ends = m119.parse_endstops(resp) if 'm119' in locals() else {}
-                            except Exception:
-                                ends = {}
-                            if ends:
-                                snap = self.state.snapshot().get("observed", {})
-                                merged = dict(snap)
-                                merged.setdefault("endstops", {}).update(ends)
-                                self.state.update_observed(merged)
-                                self.emit(StateUpdatedEvent(state=self.state.snapshot()))
-                    except Exception:
-                        pass
-                    self._last_endstop_ts = now
-            time.sleep(self.interval)
-
-    def _parse_m122(self, text: str) -> dict:
-        # Heuristic parse for VIN, MCU/Driver temps and warnings
-        vin = None; mcu_temp = None; driver_temp = None; overtemp = False
-        for line in text.splitlines():
-            ln = line.strip()
-            if "VIN:" in ln:
-                try:
-                    vin = float(ln.split("VIN:")[-1].split()[0])
-                except Exception:
-                    pass
-            if "MCU temperature" in ln or "MCU temp" in ln:
-                try:
-                    # e.g., MCU temperature: 49.6 C
-                    mcu_temp = float(ln.split(":")[-1].split()[0])
-                except Exception:
-                    pass
-            if "driver" in ln and ("temp" in ln or "overtemp" in ln.lower()):
-                if "warning" in ln.lower() or "overtemp" in ln.lower():
-                    overtemp = True
-                try:
-                    # e.g., driver temp: 85.0 C
-                    driver_temp = float(ln.split(":")[-1].split()[0])
-                except Exception:
-                    pass
-        out = {}
-        if vin is not None:
-            out["vin"] = vin
-        if mcu_temp is not None:
-            out["mcu_temp_c"] = mcu_temp
-        if driver_temp is not None:
-            out["driver_temp_c"] = driver_temp
-        if overtemp:
-            out["overtemp_warning"] = True
-        return out
-
-    def _parse_m119(self, text: str) -> dict:
-        # Heuristic parse: lines like "Endstops - X: not stopped, Y: stopped, Z: not stopped"
-        out = {}
-        for ln in text.splitlines():
-            lower = ln.lower()
-            if "x:" in lower or "y:" in lower or "z:" in lower or "u:" in lower or "v:" in lower:
-                for axis in ("x","y","z","u","v"):
-                    if f"{axis}:" in lower:
-                        try:
-                            val = lower.split(f"{axis}:")[-1].split(',')[0].strip()
-                            out[axis.upper()] = 1 if "stopped" in val else 0
-                        except Exception:
-                            pass
-        return out 
+            # Fast tier (250ms)
+            if now - self._last_fast >= self.interval_fast:
+                specs = http_fast if http_available() else serial_fast
+                for spec in specs:
+                    # Promote critical keys to MEDIUM priority so they run even during paused low-tier
+                    key = spec.params.get("key") if isinstance(spec, HttpQuerySpec) else None
+                    critical = {
+                        "move.axes[].userPosition",
+                        "state.status",
+                        "state.currentTool",
+                        "sensors.endstops[].triggered",
+                    }
+                    prio = Priority.MEDIUM if key in critical else Priority.LOW
+                    co_key = key if key else "fast"
+                    self._submit_query(spec, prio, coalesce_key=f"fast:{co_key}")
+                self._last_fast = now
+            # Medium tier (2.5s)
+            if now - self._last_medium >= self.interval_medium:
+                specs = http_medium if http_available() else serial_medium
+                for spec in specs:
+                    key = spec.params.get("key") if isinstance(spec, HttpQuerySpec) else "medium"
+                    self._submit_query(spec, Priority.MEDIUM, coalesce_key=f"medium:{key}")
+                self._last_medium = now
+            time.sleep(0.01) 

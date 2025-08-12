@@ -207,5 +207,12 @@ def parse_command_args(command: str, arg_string: str, command_def: Dict[str, Any
     for param_name, param_def in params.items():
         if not param_def.get('optional', True) and param_name not in args:
             return None, f"Missing required parameter: {param_name}"
+    # Final validation against accepts for all provided params (covers positional too)
+    for param_name, value in list(args.items()):
+        if param_name in params:
+            param_def = params[param_name] or {}
+            accepts = [str(a) for a in (param_def.get('accepts', []) or [])]
+            if accepts and str(value) not in accepts:
+                return None, f"Invalid value for {param_name}: {value}. Accepted values: {', '.join(accepts)}"
     
     return args, None 

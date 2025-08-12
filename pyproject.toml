@@ -24,6 +24,8 @@ dependencies = [
     "prompt_toolkit>=3.0.0",  # For cross-platform interactive shell
     "rich>=13.0.0",      # For rich text rendering in TUI
     "textual>=0.44.0",   # For Textual-based TUI (async, cross-platform)
+    "aiohttp>=3.9.0",    # For async HTTP transport
+    "pyserial-asyncio>=0.6",  # For async Serial transport
 ]
 
 [project.optional-dependencies]

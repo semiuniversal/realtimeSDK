@@ -298,3 +298,22 @@ commands:
     category: System
     usage-examples:
       - estop
+
+  tool:
+    purpose: Select tool by index or alias and align physical position to maintain logical coordinates.
+    category: Tool Control
+    params:
+      index:
+        purpose: Tool index or alias.
+        optional: false
+        accepts:
+          - 0
+          - a
+          - black
+          - 1
+          - b
+          - white
+    usage-examples:
+      - tool 0
+      - tool a
+      - tool white
