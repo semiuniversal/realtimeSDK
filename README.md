@@ -105,21 +105,22 @@ This will write out extra data to the log file `realtimeSDK/log/airbrush.log`. T
 
 ### Connect to Your Device
 
-If you wish to use HTTP (_strongy recommended_, it's considerably faster and uses a streamlined status update method), first attach a USB cable for a serial connection. The serial link lets the app discover the machine’s IP address.
+If you wish to use HTTP (_strongly recommended_, it's considerably faster and uses a streamlined status update method), first attach a USB cable for a serial connection. The serial link lets the app discover the machine’s IP address.
 
-- Auto-detect serial (Windows/Duet): `connect serial auto`
+- Auto-detect serial (MacOS, Windows, Linux/Duet): `connect serial auto`
+- - Note: _WSL does not reliably support serial connections at this time_
 - Specific serial port (examples): `connect serial COM9` (Windows) or `connect serial /dev/ttyACM0` (Linux)
 - Get the IP address: `ip`
   - After your first successful HTTP connection, the SDK saves the IP in its settings so you can reuse it without a serial cable next time.
-- Strong recommendation: Create a DHCP reservation for your device in your router. This prevents IP changes and eliminates serial lookups in daily use.
+- **Strong recommendation:** Create a DHCP reservation for your device in your router. This prevents IP changes and eliminates serial lookups in daily use.
 - Connect over HTTP (Duet Web Control): `connect http 192.168.x.x`
 
 Try a few commands:
-- `home`
+- `home` (_you should always home first if the machine is not in a homed state_)
 - `move x100 y0`
-- `tool 0`
+- `tool 1`
 
-Type `help` to list available commands.
+Type `help` to list available commands. For detailed help on a command type `help <commandname>`. 
 
 ---
 
@@ -134,9 +135,9 @@ Type `help` to list available commands.
   - MachineState: deep-merges observed state so fields don’t reset on partial updates
 - UI (`realtime_hairbrush/ui/textual_app.py`):
   - Top: multi-line status
-  - Left: high-level messages (Home/Move OK)
-  - Right: raw TX/RX stream with minified M408 JSON
-  - Bottom: input line
+  - Left: high-level messages (command history acknowledgements, help)
+  - Right: Simplified TX/RX stream with G-code output.
+  - Bottom: input line including up-arrow to retriev previous commands from current session. _This occasionally loses focus and you must click in it to restore typing ability_. 
 
 ### Event Flow
 
