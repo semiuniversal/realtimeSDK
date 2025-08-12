@@ -273,6 +273,11 @@ class SerialTransport(Transport):
                 line += '\n'
                 
             # Send the command
+            try:
+                # Drain any stale input before sending
+                self._serial.reset_input_buffer()
+            except Exception:
+                pass
             self._serial.write(line.encode())
             self._serial.flush()
             
@@ -281,17 +286,28 @@ class SerialTransport(Transport):
             
             # For Duet boards, wait for "ok" or "Error:"
             if self.is_duet:
-                while True:
-                    line = self._serial.readline().decode('utf-8', errors='replace').strip()
-                    if line:
-                        response += line + "\n"
-                        if line == "ok" or line.startswith("Error:"):
+                lines = []
+                deadline = time.time() + self._timeout
+                saw_terminal = False
+                while time.time() < deadline:
+                    ln = self._serial.readline().decode('utf-8', errors='replace').strip()
+                    if ln:
+                        lines.append(ln)
+                        if ln == "ok" or ln.startswith("Error:"):
+                            # small grace window to catch any stragglers
+                            grace = time.time() + 0.08
+                            while time.time() < grace and self._serial.in_waiting > 0:
+                                extra = self._serial.readline().decode('utf-8', errors='replace').strip()
+                                if extra:
+                                    lines.append(extra)
+                                    grace = time.time() + 0.04
+                            saw_terminal = True
                             break
                     else:
-                        # No more data, timeout
-                        if not response:
-                            raise TimeoutError("No response received")
-                        break
+                        time.sleep(0.005)
+                if not lines and not saw_terminal:
+                    raise TimeoutError("No response received")
+                response = "\n".join(lines) + "\n"
             else:
                 # For other boards, read until timeout
                 response = self._read_until_timeout(timeout=self._timeout)
@@ -329,6 +345,11 @@ class SerialTransport(Transport):
             if not line.endswith('\n'):
                 line += '\n'
             
+            try:
+                # Drain any stale input before sending
+                self._serial.reset_input_buffer()
+            except Exception:
+                pass
             self._serial.write(line.encode())
             self._serial.flush()
             
@@ -337,17 +358,28 @@ class SerialTransport(Transport):
             
             # For Duet boards, wait for "ok" or "Error:"
             if self.is_duet:
-                while True:
-                    line = self._serial.readline().decode('utf-8', errors='replace').strip()
-                    if line:
-                        response += line + "\n"
-                        if line == "ok" or line.startswith("Error:"):
+                lines = []
+                deadline = time.time() + self._timeout
+                saw_terminal = False
+                while time.time() < deadline:
+                    ln = self._serial.readline().decode('utf-8', errors='replace').strip()
+                    if ln:
+                        lines.append(ln)
+                        if ln == "ok" or ln.startswith("Error:"):
+                            # small grace window to catch any stragglers
+                            grace = time.time() + 0.08
+                            while time.time() < grace and self._serial.in_waiting > 0:
+                                extra = self._serial.readline().decode('utf-8', errors='replace').strip()
+                                if extra:
+                                    lines.append(extra)
+                                    grace = time.time() + 0.04
+                            saw_terminal = True
                             break
                     else:
-                        # No more data, timeout
-                        if not response:
-                            raise TimeoutError("No response received")
-                        break
+                        time.sleep(0.005)
+                if not lines and not saw_terminal:
+                    raise TimeoutError("No response received")
+                response = "\n".join(lines) + "\n"
             else:
                 # For other boards, read until timeout
                 response = self._read_until_timeout(timeout=self._timeout)

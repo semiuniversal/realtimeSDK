@@ -24,13 +24,17 @@ from realtime_hairbrush.transport.airbrush_transport import AirbrushTransport
 from realtime_hairbrush.transport.config import ConnectionConfig
 from realtime_hairbrush.config.settings import load_settings, clear_settings, update_last_connection
 from realtime_hairbrush.runtime.object_model import parse_object_model
+from realtime_hairbrush.runtime.sequencer import Request, RequestKind, Priority
+from realtime_hairbrush.runtime.sequencer import HttpQuerySpec
+from realtime_hairbrush.execution.tool_manager import ToolManager
+from semantic_gcode.dict.gcode_commands.G4.G4 import G4_Dwell
 
 
 class AirbrushTextualApp(App):
     CSS = """
     #status {
-        background: #1f3b7a; /* deep blue */
-        color: white;
+        background: #2ecc71; /* light green */
+        color: black;
         padding: 0 1;
         text-style: bold;
     }
@@ -68,7 +72,7 @@ class AirbrushTextualApp(App):
         self._hist_pos: Optional[int] = None
         self._commands = [
             "help","connect","disconnect","home","move","tool",
-            "air","paint","dot","draw","ip","gcode","settings","status","verbose","exit","quit"
+            "air","paint","dot","draw","ip","gcode","status","verbose","exit","quit"
         ]
 
         # Widgets
@@ -81,6 +85,8 @@ class AirbrushTextualApp(App):
         # Enable async agent by default in this branch; allow opt-out via AIRBRUSH_ASYNC=0
         self._use_async_agent = os.getenv("AIRBRUSH_ASYNC", "1") not in ("0", "false", "False")
         self._agent: Optional[ObjectModelAgent] = ObjectModelAgent() if self._use_async_agent else None
+        # Tool manager middleware
+        self.tool_manager: Optional[ToolManager] = None
 
     def compose(self) -> ComposeResult:
         self.status_widget = Static(self._status_block_text(), id="status")
@@ -188,6 +194,43 @@ class AirbrushTextualApp(App):
     def _emit_event_safe(self, ev) -> None:
         self.call_from_thread(self._handle_event, ev)
 
+    def _force_status_refresh(self) -> None:
+        if not self.dispatcher:
+            return
+        seq = getattr(self.dispatcher, "sequencer", None)
+        if not seq:
+            return
+        specs = [
+            ("move.axes[].machinePosition", "f"),
+            ("move.axes[].homed", "f"),
+            ("state.status", "f"),
+            ("state.currentTool", "f"),
+        ]
+        def make_cb(key: str):
+            def on_complete(res):
+                if not res or not res.ok or res.data is None:
+                    return
+                data = res.data
+                raw = data if isinstance(data, dict) else {}
+                result = raw.get("result") if isinstance(raw, dict) else None
+                patch = {}
+                if key == "move.axes[].machinePosition" and isinstance(result, list):
+                    patch = {"coords": {"machine_position": result}, "raw_status": {"raw": {"coords": {"machine": result}}}}
+                elif key == "move.axes[].homed" and isinstance(result, list):
+                    patch = {"homed": {"axes": result}, "raw_status": {"raw": {"coords": {"axesHomed": result}}}}
+                elif key == "state.status":
+                    patch = {"firmware": {"status": result}}
+                elif key == "state.currentTool":
+                    patch = {"raw_status": {"raw": {"currentTool": result}}}
+                if patch:
+                    self._merge_observed_patch(patch)
+            return on_complete
+        for key, flags in specs:
+            spec = HttpQuerySpec(endpoint="rr_model", params={"key": key, "flags": flags})
+            req = Request(kind=RequestKind.QUERY, priority=Priority.MEDIUM, payload=spec, timeout_s=2.0, on_complete=make_cb(key))
+            req.coalesce_key = f"ui:{key}"
+            seq.submit(req)
+
     def _update_status(self) -> None:
         if self.status_widget:
             self.status_widget.update(self._status_block_text())
@@ -216,14 +259,18 @@ class AirbrushTextualApp(App):
             pass
 
     def _merge_observed_patch(self, patch: dict) -> None:
+        def deep_merge(a, b):
+            if not isinstance(a, dict) or not isinstance(b, dict):
+                return b
+            out = dict(a)
+            for key, val in b.items():
+                if isinstance(val, dict):
+                    out[key] = deep_merge(out.get(key, {}), val)
+                else:
+                    out[key] = val
+            return out
         snap = self.state.snapshot().get("observed", {})
-        merged = dict(snap)
-        # shallow merge top-level only; patch should reflect minimal raw_status keys
-        for k, v in patch.items():
-            if isinstance(v, dict) and isinstance(merged.get(k), dict):
-                merged[k] = {**merged.get(k, {}), **v}
-            else:
-                merged[k] = v
+        merged = deep_merge(snap, patch or {})
         self.state.update_observed(merged)
         self._update_status()
 
@@ -294,13 +341,15 @@ class AirbrushTextualApp(App):
             self._last_status_label = label
         # Use live machine position for in-flight updates; xyz is the commanded/target position
         pos = (
-            obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("machine")
+            obs.get("coords", {}).get("machine_position")
+            or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("machine")
             or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("xyz")
             or obs.get("raw_status", {}).get("raw", {}).get("position")
         )
         # Homing info can be provided as coords.axesHomed (M408 S2) or homed (M408 S0)
         homed_list = (
-            obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed")
+            obs.get("homed", {}).get("axes")
+            or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed")
             or obs.get("raw_status", {}).get("raw", {}).get("homed")
             or []
         )
@@ -359,11 +408,9 @@ class AirbrushTextualApp(App):
             conn_label = f"Serial:{host}" if (mode == "serial") else (f"HTTP:{host}" if mode == "http" else "-:-")
         homed_text = "Yes" if homed_flag else "No"
         line1 = f"Status:{label} | ToolPos[X:{x}] [Y:{y}] [Z:{z}] | Homed:{homed_text}"
-        line2 = f"Tool:{tool_str} | Air:{air_str} | Paint:{paint_str} | Limits:{limits}"
+        line2 = f"Tool:{tool_str} | Air:{air_str} | Paint:{paint_str} | Endstops: {ends_list}"
         # Place Not Connected at the start of System line before Vin
         line3 = f"System: [{conn_label}] [Vin {vin} V] [MCU Temp: {mcu_temp} C] [{driver_label}]"
-        if ends_list:
-            line3 += f" [Endstops: {ends_list}]"
         return "\n".join([line1, line2, line3])
 
     def _handle_command_sync(self, text: str) -> None:
@@ -378,27 +425,49 @@ class AirbrushTextualApp(App):
         try:
             if cmd == "help":
                 if self.high_log:
+                    # Detailed help from commands.yaml when a topic is given
+                    try:
+                        from realtime_hairbrush.cli.utils.command_parser import parse_commands_yaml
+                        import os
+                        yaml_path = os.path.join(os.path.dirname(__file__), '..', 'commands.yaml')
+                        yaml_path = os.path.abspath(yaml_path)
+                        commands = parse_commands_yaml(yaml_path)
+                    except Exception:
+                        commands = {}
+                    topic = (rest[0].lower() if rest else None)
+                    if topic and topic in commands:
+                        cdef = commands[topic] or {}
+                        self.high_log.write(f"{topic}: {cdef.get('purpose','')}")
+                        params = cdef.get('params', {})
+                        if isinstance(params, list):
+                            # flatten list to dict
+                            p = {}
+                            for itm in params:
+                                if isinstance(itm, dict):
+                                    p.update(itm)
+                                else:
+                                    p[itm] = {}
+                            params = p
+                        if isinstance(params, dict) and params:
+                            self.high_log.write("Parameters:")
+                            for pname, pdef in params.items():
+                                if not isinstance(pdef, dict):
+                                    pdef = {}
+                                opt = pdef.get('optional', True)
+                                acc = pdef.get('accepts', []) or []
+                                self.high_log.write(f"  {pname}{' (optional)' if opt else ''}: {pdef.get('purpose','')}")
+                                if acc:
+                                    self.high_log.write(f"    accepts: {', '.join(str(a) for a in acc)}")
+                        examples = cdef.get('usage-examples', []) or []
+                        if examples:
+                            self.high_log.write("Examples:")
+                            for ex in examples:
+                                self.high_log.write(f"  {ex}")
+                        return
+                    # Fallback: list commands
                     self.high_log.write("Commands:")
-                    for line in [
-                        "  help",
-                        "  connect serial <port> [baud]",
-                        "  connect http <ip>",
-                        "  disconnect",
-                        "  home",
-                        "  move x.. y.. [z..] [f..]",
-                        "  tool N",
-                        "  air [on|off] [tool]",
-                        "  paint flow <0..1>",
-                        "  dot ...",
-                        "  draw ...",
-                        "  ip",
-                        "  gcode <raw>",
-                        "  status",
-                        "  verbose on|off",
-                        "  estop",
-                        "  exit | quit",
-                    ]:
-                        self.high_log.write(line)
+                    for name, cdef in sorted((commands or {}).items()):
+                        self.high_log.write(f"  {name}: {cdef.get('purpose','')}")
                 return
             if cmd == "verbose":
                 val = (rest[0].lower() if rest else "").strip()
@@ -533,12 +602,32 @@ class AirbrushTextualApp(App):
                 self.dispatcher.on_event(lambda ev: self.call_from_thread(self._handle_event, ev))
                 self.dispatcher.start()
                 self._listener_attached = True
+                # Wire transport into async ObjectModelAgent if enabled
+                if self._agent:
+                    try:
+                        self._agent.set_transport(self.transport)
+                    except Exception:
+                        pass
+                # Initialize ToolManager
+                try:
+                    self.tool_manager = ToolManager(self.dispatcher, self.state)
+                except Exception:
+                    self.tool_manager = None
+                # Start sequencer-backed status poller to guarantee status population
+                try:
+                    from realtime_hairbrush.runtime.readers import StatusPoller
+                    self.poller = StatusPoller(self.dispatcher.sequencer, self.state, emit=self._emit_event_safe, interval_fast=0.25, interval_medium=2.5, interval_slow=25.0)
+                    self.poller.start()
+                except Exception:
+                    self.poller = None
                 # Immediately fetch full status once on connect
                 try:
                     if self._agent:
                         self._agent.request_snapshot_now()
                     else:
                         self._refresh_status_once()
+                    # Also force a targeted refresh via sequencer to populate homed and coords immediately
+                    self._force_status_refresh()
                 finally:
                     # update UI immediately regardless of fetch outcome
                     self.call_from_thread(self._update_status)
@@ -595,22 +684,30 @@ class AirbrushTextualApp(App):
                 return
             if cmd == "home":
                 from semantic_gcode.dict.gcode_commands.G28.G28 import G28_Home
-                from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
                 g28 = G28_Home.create(axes=None)
-                m400 = M400_WaitForMoves.create()
                 if self.dispatcher:
                     self.dispatcher.enqueue(g28)
-                    self.dispatcher.enqueue(m400)
                 else:
                     self.transport.send_line(str(g28))
-                    self.transport.query(str(m400))
                 return
             if cmd == "move":
                 # move x.. y.. [z..] [f..]
                 # Block if not homed
                 try:
-                    homed = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
-                    if not (bool(int(homed[0])) and bool(int(homed[1])) and bool(int(homed[2]))):
+                    obs = self.state.snapshot().get("observed", {})
+                    homed = (
+                        obs.get("homed", {}).get("axes")
+                        or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed")
+                        or obs.get("raw_status", {}).get("raw", {}).get("homed")
+                        or []
+                    )
+                    ok = False
+                    if isinstance(homed, (list, tuple)) and len(homed) >= 3:
+                        try:
+                            ok = bool(int(homed[0])) and bool(int(homed[1])) and bool(int(homed[2]))
+                        except Exception:
+                            ok = False
+                    if not ok:
                         if self.high_log:
                             self.high_log.write("[error] Machine is not homed. Please home first.")
                         return
@@ -627,9 +724,7 @@ class AirbrushTextualApp(App):
                     if self.high_log:
                         self.high_log.write("[error] move requires at least one of x, y, z")
                     return
-                from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
-                from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
-                # If Z not provided, include current Z from object model to send a full X/Y/Z triple
+                # Fill Z from observed if omitted
                 if z is None:
                     try:
                         snap = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {})
@@ -642,50 +737,26 @@ class AirbrushTextualApp(App):
                             z = float(pos[2])
                     except Exception:
                         z = z
-                params = {}
-                if x is not None: params['x'] = x
-                if y is not None: params['y'] = y
-                if z is not None: params['z'] = z
-                if f is not None: params['feedrate'] = f
-                g1 = G1_LinearMove.create(**params)
-                # Compute a rough ETA to set a safe timeout for M400 (HTTP/macOS often delays acks)
-                eta_s = 10.0
-                try:
-                    # Current pos (fallback zeros)
-                    cur = [0.0, 0.0, 0.0]
-                    snap = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {})
-                    pos = (
-                        snap.get("coords", {}).get("machine")
-                        or snap.get("coords", {}).get("xyz")
-                        or snap.get("position")
-                    )
-                    if isinstance(pos, (list, tuple)) and len(pos) >= 3:
-                        cur = [float(pos[0] or 0), float(pos[1] or 0), float(pos[2] or 0)]
-                    tgt = [cur[0] if x is None else x, cur[1] if y is None else y, cur[2] if z is None else z]
-                    dx = (tgt[0] - cur[0])
-                    dy = (tgt[1] - cur[1])
-                    dz = (tgt[2] - cur[2])
-                    dist = (dx*dx + dy*dy + dz*dz) ** 0.5
-                    speed = f if f is not None else 50.0  # assume mm/s if not provided
-                    if speed <= 0:
-                        speed = 10.0
-                    eta_s = max(5.0, min(120.0, dist / speed * 1.5 + 3.0))
-                except Exception:
-                    eta_s = 15.0
-                # Temporarily raise transport timeout for the upcoming M400
-                try:
-                    self._move_timeout_prev = getattr(self.transport.config, 'timeout', None)
-                    if self._move_timeout_prev is None or self._move_timeout_prev < eta_s:
-                        self.transport.config.timeout = float(eta_s)
-                except Exception:
-                    pass
-                m400 = M400_WaitForMoves.create()
-                if self.dispatcher:
-                    self.dispatcher.enqueue(g1)
-                    self.dispatcher.enqueue(m400)
+                if self.tool_manager:
+                    self.tool_manager.move_to(x if x is not None else self.tool_manager.get_logical_position()['x'],
+                                              y if y is not None else self.tool_manager.get_logical_position()['y'],
+                                              z=z,
+                                              feedrate=f if f is not None else 3000,
+                                              wait=True)
                 else:
-                    self.transport.send_line(str(g1))
-                    self.transport.query(str(m400))
+                    from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
+                    from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
+                    params = {}
+                    if x is not None: params['x'] = x
+                    if y is not None: params['y'] = y
+                    if z is not None: params['z'] = z
+                    if f is not None: params['feedrate'] = f
+                    g1 = G1_LinearMove.create(**params)
+                    m400 = M400_WaitForMoves.create()
+                    if self.dispatcher:
+                        self.dispatcher.enqueue(g1); self.dispatcher.enqueue(m400)
+                    else:
+                        self.transport.send_line(str(g1)); self.transport.query(str(m400))
                 # Notify async agent that motion is active; it will poll coords faster during motion
                 if self._agent:
                     try:
@@ -699,17 +770,46 @@ class AirbrushTextualApp(App):
                     if self.high_log:
                         self.high_log.write("[error] tool requires index")
                     return
-                idx = int(rest[0])
-                from semantic_gcode.dict.gcode_commands.T.T import T_SelectTool
-                from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
-                tsel = T_SelectTool.create(tool_number=idx)
-                m400 = M400_WaitForMoves.create()
-                if self.dispatcher:
-                    self.dispatcher.enqueue(tsel); self.dispatcher.enqueue(m400)
+                raw = rest[0]
+                resolved_idx = None
+                if self.tool_manager:
+                    try:
+                        # Let ToolManager resolve aliases and perform the switch
+                        self.tool_manager.switch_tool(raw, wait=True)
+                        # Best-effort derive numeric index from alias for local observed patch
+                        rl = str(raw).lower()
+                        if rl.isdigit():
+                            resolved_idx = int(rl)
+                        elif rl in ("1","b","white"): resolved_idx = 1
+                        elif rl in ("0","a","black"): resolved_idx = 0
+                    except Exception as e:
+                        if self.high_log:
+                            self.high_log.write(f"[error] tool: {e}")
+                        return
                 else:
-                    self.transport.send_line(str(tsel)); self.transport.query(str(m400))
-                # Immediate local update of tool index in observed state
-                self._merge_observed_patch({"raw_status": {"raw": {"currentTool": idx}}})
+                    # Fallback: attempt to resolve alias locally
+                    rl = str(raw).lower()
+                    if rl.isdigit():
+                        resolved_idx = int(rl)
+                    elif rl in ("1","b","white"):
+                        resolved_idx = 1
+                    elif rl in ("0","a","black"):
+                        resolved_idx = 0
+                    else:
+                        if self.high_log:
+                            self.high_log.write("[error] tool: expected 0/a/black or 1/b/white")
+                        return
+                    from semantic_gcode.dict.gcode_commands.T.T import T_SelectTool
+                    from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
+                    tsel = T_SelectTool.create(tool_number=resolved_idx)
+                    m400 = M400_WaitForMoves.create()
+                    if self.dispatcher:
+                        self.dispatcher.enqueue(tsel); self.dispatcher.enqueue(m400)
+                    else:
+                        self.transport.send_line(str(tsel)); self.transport.query(str(m400))
+                # Local update of tool index in observed state (status polling will confirm)
+                if resolved_idx is not None:
+                    self._merge_observed_patch({"raw_status": {"raw": {"currentTool": resolved_idx}}})
                 return
             if cmd == "air":
                 # air [on|off] [tool]
@@ -721,40 +821,47 @@ class AirbrushTextualApp(App):
                         state = t
                     elif t in ("0","a","black","1","b","white"):
                         tool_arg = t
-                # default tool selection from observed state
-                obs_tool = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("tool")
-                tool_index = 0 if obs_tool is None else int(obs_tool)
-                if tool_arg in ("1","b","white"):
-                    tool_index = 1
-                fan_on = 2 if tool_index == 0 else 3
-                fan_other = 3 if tool_index == 0 else 2
-                from semantic_gcode.dict.gcode_commands.M106.M106 import M106_FanControl
-                seq = []
-                # Normalize state
                 is_on = (state is None) or (state in ("on","1","true","yes"))
                 is_off = (state in ("off","0","false","no"))
-                if is_on:
-                    # Enforce exclusivity: turn the other fan off, then this one on
-                    seq.append(M106_FanControl.create(p=fan_other, s=0.0))
-                    seq.append(M106_FanControl.create(p=fan_on, s=1.0))
-                elif is_off:
-                    # If no tool specified, turn off all air; else turn off selected only
-                    if tool_arg is None:
-                        seq.append(M106_FanControl.create(p=2, s=0.0))
-                        seq.append(M106_FanControl.create(p=3, s=0.0))
+                target = tool_arg
+                if self.tool_manager:
+                    if is_on:
+                        self.tool_manager.set_air(True, tool=target)
+                    elif is_off:
+                        self.tool_manager.set_air(False, tool=target)
                     else:
-                        seq.append(M106_FanControl.create(p=fan_on, s=0.0))
+                        if self.high_log:
+                            self.high_log.write("[error] air: unknown state; use on/off")
+                        return
                 else:
-                    if self.high_log:
-                        self.high_log.write("[error] air: unknown state; use on/off")
-                    return
-                if self.dispatcher:
-                    for instr in seq:
-                        self.dispatcher.enqueue(instr)
-                else:
-                    for instr in seq:
-                        s = str(instr)
-                        self.transport.send_line(s)
+                    # Fallback (previous behavior)
+                    from semantic_gcode.dict.gcode_commands.M106.M106 import M106_FanControl
+                    obs_tool = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("tool")
+                    tool_index = 0 if obs_tool is None else int(obs_tool)
+                    if tool_arg in ("1","b","white"):
+                        tool_index = 1
+                    fan_on = 2 if tool_index == 0 else 3
+                    fan_other = 3 if tool_index == 0 else 2
+                    seq = []
+                    if is_on:
+                        seq.append(M106_FanControl.create(p=fan_other, s=0.0))
+                        seq.append(M106_FanControl.create(p=fan_on, s=1.0))
+                    elif is_off:
+                        if tool_arg is None:
+                            seq.append(M106_FanControl.create(p=2, s=0.0))
+                            seq.append(M106_FanControl.create(p=3, s=0.0))
+                        else:
+                            seq.append(M106_FanControl.create(p=fan_on, s=0.0))
+                    else:
+                        if self.high_log:
+                            self.high_log.write("[error] air: unknown state; use on/off")
+                        return
+                    if self.dispatcher:
+                        for instr in seq:
+                            self.dispatcher.enqueue(instr)
+                    else:
+                        for instr in seq:
+                            self.transport.send_line(str(instr))
                 # After enqueuing, update local observed fanPercent immediately
                 # Determine indexes again (simple re-eval)
                 tool_index = self._get_current_tool_index()
@@ -785,7 +892,7 @@ class AirbrushTextualApp(App):
                 # paint <flow 0..1>
                 # Block if not homed
                 try:
-                    homed = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
+                    obs = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
                     if not (bool(int(homed[0])) and bool(int(homed[1])) and bool(int(homed[2]))):
                         if self.high_log:
                             self.high_log.write("[error] Machine is not homed. Please home first.")
@@ -805,19 +912,22 @@ class AirbrushTextualApp(App):
                         self.high_log.write("[error] flow must be a number 0..1")
                     return
                 flow = max(0.0, min(1.0, flow))
-                # Determine tool -> axis
-                obs_tool = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("tool")
-                tool_index = 0 if obs_tool is None else int(obs_tool)
-                axis = 'u' if tool_index == 0 else 'v'
-                from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
-                from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
-                params = {axis: flow}
-                g1 = G1_LinearMove.create(**params)
-                m400 = M400_WaitForMoves.create()
-                if self.dispatcher:
-                    self.dispatcher.enqueue(g1); self.dispatcher.enqueue(m400)
+                if self.tool_manager:
+                    self.tool_manager.set_paint_flow(flow, tool=None, wait=True)
                 else:
-                    self.transport.send_line(str(g1)); self.transport.query(str(m400))
+                    # Fallback to legacy per-axis move
+                    obs_tool = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("tool")
+                    tool_index = 0 if obs_tool is None else int(obs_tool)
+                    axis = 'u' if tool_index == 0 else 'v'
+                    from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
+                    from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
+                    params = {axis: flow}
+                    g1 = G1_LinearMove.create(**params)
+                    m400 = M400_WaitForMoves.create()
+                    if self.dispatcher:
+                        self.dispatcher.enqueue(g1); self.dispatcher.enqueue(m400)
+                    else:
+                        self.transport.send_line(str(g1)); self.transport.query(str(m400))
                 # After issuing G1 U/V, update predictive position immediately
                 tool_index = self._get_current_tool_index()
                 axis = 'u' if tool_index == 0 else 'v'
@@ -848,7 +958,25 @@ class AirbrushTextualApp(App):
                     if self.high_log:
                         self.high_log.write("[error] Machine is not homed. Please home first.")
                     return
-                tokens = {rest[i].lower(): rest[i+1] for i in range(0, len(rest)-1, 2) if rest[i].lower() in ("tool","p","x","y","z","ms")}
+                # Flexible token parsing: accept pairs (k v) and compact forms like x100, y100, z60, ms100
+                tokens = {}
+                keys = ("tool","p","x","y","z","ms")
+                i = 0
+                while i < len(rest):
+                    t = rest[i].strip()
+                    tl = t.lower()
+                    if tl in keys and i + 1 < len(rest):
+                        tokens[tl] = rest[i+1]
+                        i += 2
+                        continue
+                    # compact form detection
+                    matched = False
+                    for name in keys:
+                        if tl.startswith(name) and len(tl) > len(name):
+                            tokens[name] = t[len(name):]
+                            matched = True
+                            break
+                    i += 1 if matched else 1
                 tool_tok = tokens.get("tool")
                 try:
                     flow = float(tokens.get("p",""))
@@ -861,57 +989,66 @@ class AirbrushTextualApp(App):
                         self.high_log.write("[error] dot requires: p <0..1> x <num> y <num> z <num> ms <int>")
                     return
                 flow = max(0.0, min(1.0, flow))
-                # Determine tool and mapping
-                tool_index = None
-                if tool_tok is not None:
-                    tool_index = 1 if tool_tok.lower() in ("1","b","white") else 0
+                # Tool-managed sequence
+                if self.tool_manager:
+                    if tool_tok is not None:
+                        self.tool_manager.switch_tool(tool_tok, wait=True)
+                    self.tool_manager.set_air(True)
+                    self.tool_manager.move_to(x, y, z=z, feedrate=24000, wait=True)
+                    self.tool_manager.set_paint_flow(max(0.0, min(1.0, flow)), wait=True)
+                    self.dispatcher.enqueue(G4_Dwell.create(p=ms))
+                    self.tool_manager.stop_paint_flow(wait=True)
+                    self.tool_manager.set_air(False)
                 else:
-                    obs_tool = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("tool")
-                    tool_index = 0 if obs_tool is None else int(obs_tool)
-                fan_on = 2 if tool_index == 0 else 3
-                fan_other = 3 if tool_index == 0 else 2
-                axis = 'u' if tool_index == 0 else 'v'
-                from semantic_gcode.dict.gcode_commands.T.T import T_SelectTool
-                from semantic_gcode.dict.gcode_commands.M106.M106 import M106_FanControl
-                from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
-                from semantic_gcode.dict.gcode_commands.G4.G4 import G4_Dwell
-                from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
-                seq = []
-                # Optional tool select
-                seq.append(T_SelectTool.create(tool_number=tool_index))
-                # Enforce exclusivity: turn off other, then turn on selected
-                seq.append(M106_FanControl.create(p=fan_other, s=0.0))
-                seq.append(M106_FanControl.create(p=fan_on, s=1.0))
-                # Move to position
-                seq.append(G1_LinearMove.create(x=x, y=y, z=z))
-                # Set paint flow
-                seq.append(G1_LinearMove.create(**{axis: flow}))
-                # Dwell
-                seq.append(G4_Dwell.create(p=ms))
-                # Paint off
-                seq.append(G1_LinearMove.create(**{axis: 0.0}))
-                # Air off
-                seq.append(M106_FanControl.create(p=fan_on, s=0.0))
-                # Gate with M400 at end
-                seq.append(M400_WaitForMoves.create())
-                if self.dispatcher:
+                    # Fallback legacy path
+                    from semantic_gcode.dict.gcode_commands.T.T import T_SelectTool
+                    from semantic_gcode.dict.gcode_commands.M106.M106 import M106_FanControl
+                    from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
+                    from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
+                    tool_index = 1 if (tool_tok or "0").lower() in ("1","b","white") else 0
+                    fan_on = 2 if tool_index == 0 else 3
+                    fan_other = 3 if tool_index == 0 else 2
+                    axis = 'u' if tool_index == 0 else 'v'
+                    seq = [
+                        T_SelectTool.create(tool_number=tool_index),
+                        M106_FanControl.create(p=fan_other, s=0.0),
+                        M106_FanControl.create(p=fan_on, s=1.0),
+                        G1_LinearMove.create(x=x, y=y, z=z),
+                        G1_LinearMove.create(**{axis: flow}),
+                        G4_Dwell.create(p=ms),
+                        G1_LinearMove.create(**{axis: 0.0}),
+                        M106_FanControl.create(p=fan_on, s=0.0),
+                        M400_WaitForMoves.create(),
+                    ]
                     for instr in seq:
                         self.dispatcher.enqueue(instr)
-                else:
-                    for instr in seq:
-                        s = str(instr)
-                        self.transport.send_line(s)
                 return
             if cmd == "draw":
                 # draw [params per commands.yaml]
                 # Parse key/value pairs, allow bare tokens like 'tool' then value
                 tokens = {}
+                keys = ("tool","p","f","xs","ys","zs","xe","ye","ze","ps")
                 i = 0
-                while i < len(rest) - 1:
-                    key = rest[i].lower()
-                    val = rest[i+1]
-                    tokens[key] = val
-                    i += 2
+                while i < len(rest):
+                    t = rest[i].strip()
+                    tl = t.lower()
+                    if tl in keys and i + 1 < len(rest):
+                        tokens[tl] = rest[i+1]
+                        i += 2
+                        continue
+                    # compact forms like f1000, xs0, ys0, z50 (maps to zs), xe200, ye0, ze10, ps.2
+                    matched = False
+                    # Special-case single 'z' to mean starting Z (zs)
+                    if tl.startswith('z') and not tl.startswith('ze') and not tl.startswith('zs') and len(tl) > 1:
+                        tokens['zs'] = t[1:]
+                        matched = True
+                    else:
+                        for name in ("xs","ys","zs","xe","ye","ze","ps","f","p","tool"):
+                            if tl.startswith(name) and len(tl) > len(name):
+                                tokens[name] = t[len(name):]
+                                matched = True
+                                break
+                    i += 1 if matched else 1
                 # Defaults
                 tool_tok = tokens.get("tool")
                 try:
@@ -945,52 +1082,55 @@ class AirbrushTextualApp(App):
                     if self.high_log:
                         self.high_log.write("[error] invalid numeric value in draw")
                     return
-                # Determine tool and mapping
-                if tool_tok is not None:
-                    tool_index = 1 if tool_tok.lower() in ("1","b","white") else 0
+                if self.tool_manager:
+                    if tool_tok is not None:
+                        self.tool_manager.switch_tool(tool_tok, wait=True)
+                    # Optional move to start
+                    if xs_f is not None or ys_f is not None or zs_f is not None:
+                        self.tool_manager.move_to(xs_f if xs_f is not None else self.tool_manager.get_logical_position()['x'],
+                                                  ys_f if ys_f is not None else self.tool_manager.get_logical_position()['y'],
+                                                  z=zs_f, feedrate=24000, wait=True)
+                    # Air on, set initial flow
+                    self.tool_manager.set_air(True)
+                    self.tool_manager.set_paint_flow(max(0.0, min(1.0, p)), wait=True)
+                    # Move to end
+                    self.tool_manager.move_to(xe_f, ye_f, z=ze_f, feedrate=(f_f if f_f is not None else 3000), wait=True)
+                    # Optional ending paint flow
+                    if ps_val is not None:
+                        self.tool_manager.set_paint_flow(max(0.0, min(1.0, ps_val)), wait=True)
+                    # Stop paint and air off
+                    self.tool_manager.stop_paint_flow(wait=True)
+                    self.tool_manager.set_air(False)
                 else:
-                    obs_tool = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("tool")
-                    tool_index = 0 if obs_tool is None else int(obs_tool)
-                fan_on = 2 if tool_index == 0 else 3
-                fan_other = 3 if tool_index == 0 else 2
-                axis = 'u' if tool_index == 0 else 'v'
-                from semantic_gcode.dict.gcode_commands.T.T import T_SelectTool
-                from semantic_gcode.dict.gcode_commands.M106.M106 import M106_FanControl
-                from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
-                from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
-                seq = []
-                # Tool select if needed
-                seq.append(T_SelectTool.create(tool_number=tool_index))
-                # Optional move to start
-                if xs_f is not None or ys_f is not None or zs_f is not None:
-                    seq.append(G1_LinearMove.create(x=xs_f, y=ys_f, z=zs_f))
-                # Enforce exclusivity: other off, selected on
-                seq.append(M106_FanControl.create(p=fan_other, s=0.0))
-                seq.append(M106_FanControl.create(p=fan_on, s=1.0))
-                # Set initial paint flow
-                seq.append(G1_LinearMove.create(**{axis: max(0.0, min(1.0, p))}))
-                # Move to end with optional feedrate
-                params = {"x": xe_f, "y": ye_f}
-                if ze_f is not None:
-                    params["z"] = ze_f
-                if f_f is not None:
-                    params["feedrate"] = f_f
-                seq.append(G1_LinearMove.create(**params))
-                # Optional ending paint flow
-                if ps_val is not None:
-                    seq.append(G1_LinearMove.create(**{axis: max(0.0, min(1.0, ps_val))}))
-                # Paint off and air off
-                seq.append(G1_LinearMove.create(**{axis: 0.0}))
-                seq.append(M106_FanControl.create(p=fan_on, s=0.0))
-                # Gate
-                seq.append(M400_WaitForMoves.create())
-                if self.dispatcher:
+                    # Fallback legacy behavior
+                    from semantic_gcode.dict.gcode_commands.T.T import T_SelectTool
+                    from semantic_gcode.dict.gcode_commands.M106.M106 import M106_FanControl
+                    from semantic_gcode.dict.gcode_commands.G1.G1 import G1_LinearMove
+                    from semantic_gcode.dict.gcode_commands.M400.M400 import M400_WaitForMoves
+                    tool_index = 1 if (tool_tok or "0").lower() in ("1","b","white") else 0
+                    fan_on = 2 if tool_index == 0 else 3
+                    fan_other = 3 if tool_index == 0 else 2
+                    axis = 'u' if tool_index == 0 else 'v'
+                    seq = []
+                    seq.append(T_SelectTool.create(tool_number=tool_index))
+                    if xs_f is not None or ys_f is not None or zs_f is not None:
+                        seq.append(G1_LinearMove.create(x=xs_f, y=ys_f, z=zs_f))
+                    seq.append(M106_FanControl.create(p=fan_other, s=0.0))
+                    seq.append(M106_FanControl.create(p=fan_on, s=1.0))
+                    seq.append(G1_LinearMove.create(**{axis: max(0.0, min(1.0, p))}))
+                    params = {"x": xe_f, "y": ye_f}
+                    if ze_f is not None:
+                        params["z"] = ze_f
+                    if f_f is not None:
+                        params["feedrate"] = f_f
+                    seq.append(G1_LinearMove.create(**params))
+                    if ps_val is not None:
+                        seq.append(G1_LinearMove.create(**{axis: max(0.0, min(1.0, ps_val))}))
+                    seq.append(G1_LinearMove.create(**{axis: 0.0}))
+                    seq.append(M106_FanControl.create(p=fan_on, s=0.0))
+                    seq.append(M400_WaitForMoves.create())
                     for instr in seq:
                         self.dispatcher.enqueue(instr)
-                else:
-                    for instr in seq:
-                        s = str(instr)
-                        self.transport.send_line(s)
                 return
             if cmd == "ip":
                 # Auto-connect to serial and query IP (M552)
@@ -1069,26 +1209,31 @@ class AirbrushTextualApp(App):
                             line = "M552"
                         if self.gcode_log:
                             self.gcode_log.write(escape(f"→ {line}"))
-                        # Send and wait for OK, then wait for the subsequent IPv4 line via ReceivedEvent
+                        # Send and try to extract IP directly from immediate response
                         resp = self.transport.query(line)
                         if resp and self.gcode_log:
                             self.gcode_log.write(escape(f"← {resp.strip()}"))
-                        # Begin wait for the asynchronous IPv4 line
-                        self._ip_wait_active = True
-                        self._ip_wait_result = None
-                        try:
-                            self._ip_wait_event.clear()
-                        except Exception:
-                            pass
-                        # Wait up to 8 seconds for the IP line to appear
-                        try:
-                            self._ip_wait_event.wait(8.0)
-                        except Exception:
-                            pass
-                        if self._ip_wait_result:
-                            ip = self._ip_wait_result
-                        self._ip_wait_active = False
-                        self._ip_wait_result = None
+                        # Direct regex extraction
+                        import re as _re
+                        m = _re.search(r"IP address\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", resp or "")
+                        if m:
+                            ip = m.group(1)
+                        # If not found, begin wait for an asynchronous IPv4 line via ReceivedEvent
+                        if not ip:
+                            self._ip_wait_active = True
+                            self._ip_wait_result = None
+                            try:
+                                self._ip_wait_event.clear()
+                            except Exception:
+                                pass
+                            try:
+                                self._ip_wait_event.wait(8.0)
+                            except Exception:
+                                pass
+                            if self._ip_wait_result:
+                                ip = self._ip_wait_result
+                            self._ip_wait_active = False
+                            self._ip_wait_result = None
                     if self.high_log:
                         self.high_log.write(f"IP: {ip or 'unknown'}")
                 except Exception as e:
@@ -1169,9 +1314,35 @@ class AirbrushTextualApp(App):
                 except Exception as e:
                     if self.high_log:
                         self.high_log.write(f"[error] estop: {e}")
-                if self.high_log:
-                    self.high_log.write("E-Stop sent (M999). Device may reset; connection may drop.")
-                return
+                # Immediately disconnect to prevent further commands hitting a rebooting board
+                try:
+                    if self.poller:
+                        try:
+                            self.poller.stop()
+                        except Exception:
+                            pass
+                        self.poller = None
+                    if self.dispatcher:
+                        try:
+                            stop = getattr(self.dispatcher, "stop", None)
+                            if callable(stop):
+                                stop()
+                        except Exception:
+                            pass
+                        self.dispatcher = None
+                    self._listener_attached = False
+                    if self.transport and self.transport.is_connected():
+                        try:
+                            self.transport.disconnect()
+                        except Exception:
+                            pass
+                    self.transport = None
+                    self._last_status_ts = 0.0
+                    if self.high_log:
+                        self.high_log.write("E-Stop sent (M999). Disconnected immediately. Reconnect when ready.")
+                    self.call_from_thread(self._update_status)
+                finally:
+                    return
             if self.high_log:
                 self.high_log.write(f"[error] Unknown command: {cmd}")
         except Exception as e:
@@ -1235,9 +1406,14 @@ class AirbrushTextualApp(App):
                     if self.high_log:
                         self.high_log.write(txt)
                     return
-                # Suppress object-model JSON when verbose is OFF
-                if (not self._verbose) and (txt.startswith("{") or '"status"' in txt):
-                    return
+                # Suppress floody noise when verbose is OFF
+                if (not self._verbose):
+                    # Hide large JSON/object-model dumps
+                    if (txt.startswith("{") or '"status"' in txt):
+                        return
+                    # Hide generic ok and legacy acc chatter
+                    if low == 'ok' or low.startswith('ok ') or low.startswith('acc'):
+                        return
                 # Suppress 'ok' only for M408 when verbose is OFF
                 if (not self._verbose) and self._last_sent_was_m408 and txt.lower() == 'ok':
                     return
@@ -1275,6 +1451,8 @@ class AirbrushTextualApp(App):
                     except Exception:
                         pass
                 self._refresh_status_once()
+                # Force an immediate update of homed and coords via rr_model
+                self._force_status_refresh()
                 self._last_status_ts = time.time()
                 # Restore prior transport timeout after gated motion completes
                 try:

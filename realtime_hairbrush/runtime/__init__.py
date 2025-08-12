@@ -8,4 +8,8 @@ from .events import RuntimeEvent, SentEvent, ReceivedEvent, AckEvent, ErrorEvent
 from .queue import InstructionQueue
 from .dispatcher import Dispatcher
 from .state import MachineState
-from .object_model_agent import ObjectModelAgent 
+from .object_model_agent import ObjectModelAgent
+
+# Expose new sequencer API
+from .sequencer import RequestSequencer
+from .sequencer import Request, Result, Priority, RequestKind 

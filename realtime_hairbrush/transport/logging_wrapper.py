@@ -12,6 +12,10 @@ _log_init_lock = threading.Lock()
 _log_initialized = False
 
 
+STATUS_LOG_ENABLED = os.getenv("AIRBRUSH_STATUS_LOG", "0") in ("1", "true", "True")
+FULL_GCODE_TRACE = os.getenv("AIRBRUSH_GCODE_TRACE", "0") in ("1", "true", "True")
+
+
 def _repo_root_log_path() -> str:
     # Compute repo root as two levels up from this file: realtimeSDK/
     here = os.path.dirname(__file__)
@@ -84,9 +88,36 @@ def log_note(text: str) -> None:
         pass
 
 
+def _is_status_query(cmd: Optional[str]) -> bool:
+    if not cmd:
+        return True
+    t = str(cmd).strip().lower()
+    if not t:
+        return True
+    return (
+        t.startswith("m409") or t.startswith("m408") or t.startswith("m114") or t.startswith("m105") or t.startswith("rr_reply") or t.startswith("rr_model")
+    )
+
+
+def _is_mutation(cmd: Optional[str]) -> bool:
+    if not cmd:
+        return False
+    t = str(cmd).strip().upper()
+    if not t:
+        return False
+    # Movement and machine state changing commands
+    return (
+        t.startswith("G0") or t.startswith("G1") or t.startswith("G2") or t.startswith("G3") or
+        t.startswith("G28") or t.startswith("G92") or t.startswith("M400") or t.startswith("M98") or
+        t.startswith("M106") or t.startswith("M107") or t.startswith("M104") or t.startswith("M109") or
+        t.startswith("M140") or t.startswith("M190") or t.startswith("T ") or t == "T" or t.startswith("M999") or
+        t.startswith("M552")
+    )
+
+
 class LoggingTransport(Transport):
     """
-    Decorator for Transport that logs all TX/RX to a file.
+    Decorator for Transport that logs all TX/R to a file.
     The log file is truncated once per process session on first use.
     """
 
@@ -135,27 +166,40 @@ class LoggingTransport(Transport):
             raise
 
     def send_line(self, line: str) -> bool:
-        self._log("TX", line.replace("\n", "\\n"))
+        # Log only mutating commands unless FULL_GCODE_TRACE
+        if FULL_GCODE_TRACE or _is_mutation(line):
+            tag = "ACTUAL-TX" if FULL_GCODE_TRACE else "TX"
+            self._log(tag, line.replace("\n", "\\n"))
         try:
             ok = self.inner.send_line(line)
-            self._log("TX-OK", str(ok))
+            if FULL_GCODE_TRACE or _is_mutation(line):
+                tag = "TX-OK"
+                self._log(tag, str(ok))
             return ok
         except Exception as e:
-            self._log("TX-ERR", str(e))
+            if FULL_GCODE_TRACE or _is_mutation(line):
+                self._log("TX-ERR", str(e))
             raise
 
     def query(self, query_cmd: str) -> Optional[str]:
-        # Short-circuit empty queries to avoid logging churn
-        if not query_cmd or not str(query_cmd).strip():
-            return None
-        self._log("Q", (query_cmd if query_cmd else "<empty>").replace("\n", "\\n"))
+        # Status queries suppressed unless explicitly enabled (never trace rr_model here)
+        if _is_status_query(query_cmd) and not _is_mutation(query_cmd) and not STATUS_LOG_ENABLED:
+            return self.inner.query(query_cmd)
+        # Log G-code Q when FULL_GCODE_TRACE or if mutation; suppress rr_model
+        if not _is_status_query(query_cmd) and (FULL_GCODE_TRACE or _is_mutation(query_cmd) or STATUS_LOG_ENABLED):
+            self._log("Q", (query_cmd if query_cmd else "<empty>").replace("\n", "\\n"))
         try:
             resp = self.inner.query(query_cmd)
-            txt = (resp or "").replace("\n", " ").strip()
-            self._log("R", txt if txt else "<none>")
+            # Log replies for G-code only (exclude rr_model/rr_reply unless STATUS_LOG_ENABLED)
+            should_log_rx = not _is_status_query(query_cmd)
+            if should_log_rx and (FULL_GCODE_TRACE or _is_mutation(query_cmd) or STATUS_LOG_ENABLED):
+                txt = (resp or "").replace("\n", " ").strip()
+                tag = "ACTUAL-RX" if FULL_GCODE_TRACE else "R"
+                self._log(tag, txt if txt else "<none>")
             return resp
         except Exception as e:
-            self._log("Q-ERR", str(e))
+            if not _is_status_query(query_cmd) and (FULL_GCODE_TRACE or _is_mutation(query_cmd) or STATUS_LOG_ENABLED):
+                self._log("Q-ERR", str(e))
             raise
 
     def get_status(self) -> Dict[str, Any]:
@@ -165,4 +209,25 @@ class LoggingTransport(Transport):
             return st
         except Exception as e:
             self._log("STATUS-ERR", str(e))
-            raise 
+            raise
+
+    # HTTP rr_model/rr_reply forwarding for HttpTransport (status suppressed by default)
+    def get_model(self, key: Optional[str] = None, flags: Optional[str] = None):
+        if STATUS_LOG_ENABLED:
+            self._log("RR_MODEL", f"key={key} flags={flags}")
+        getter = getattr(self.inner, "get_model", None)
+        if callable(getter):
+            data = getter(key=key, flags=flags)
+            if STATUS_LOG_ENABLED:
+                self._log("RR_MODEL_R", str(data)[:300])
+            return data
+        return None
+
+    def read_reply(self) -> Optional[str]:
+        reader = getattr(self.inner, "read_reply", None)
+        if callable(reader):
+            data = reader()
+            if STATUS_LOG_ENABLED:
+                self._log("RR_REPLY", str(data)[:300])
+            return data
+        return None 

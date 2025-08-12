@@ -11,6 +11,10 @@ from .queue import InstructionQueue
 from ..transport.airbrush_transport import AirbrushTransport
 from .state import MachineState
 
+# New imports for sequencer integration
+from .sequencer import RequestSequencer
+from .sequencer import Request, Result, Priority, RequestKind
+
 
 class Dispatcher:
     def __init__(self, transport: AirbrushTransport, state: MachineState) -> None:
@@ -20,6 +24,8 @@ class Dispatcher:
         self._listeners: List[Callable] = []
         self._stop = threading.Event()
         self._worker: Optional[threading.Thread] = None
+        # Single-threaded request sequencer; it is the sole I/O owner
+        self.sequencer = RequestSequencer(transport=self.transport, on_event=self._emit)
 
     def on_event(self, callback: Callable) -> None:
         self._listeners.append(callback)
@@ -38,13 +44,48 @@ class Dispatcher:
         if self._worker and self._worker.is_alive():
             return
         self._stop.clear()
+        self.sequencer.start()
         self._worker = threading.Thread(target=self._run_loop, daemon=True)
         self._worker.start()
 
     def stop(self) -> None:
         self._stop.set()
+        try:
+            self.sequencer.stop()
+        except Exception:
+            pass
         if self._worker:
             self._worker.join(timeout=1.0)
+
+    def _to_request(self, instr: GCodeInstruction) -> Request:
+        line = str(instr)
+        # Infer behavior
+        needs_ack = isinstance(instr, ExpectsAcknowledgement) or isinstance(instr, BlocksExecution)
+        side_effects = set()
+        upper = line.strip().upper()
+        if upper.startswith("G28") or upper.startswith("T") or upper.startswith("M98"):
+            side_effects.add("LongRunning")
+        # Priority: ensure motion and tool-select are not reordered behind M400
+        if upper.startswith("G0") or upper.startswith("G1") or upper.startswith("T"):
+            priority = Priority.HIGH
+        else:
+            priority = Priority.HIGH if needs_ack else Priority.MEDIUM
+        # Timeout heuristics
+        timeout_s = 30.0 if ("LongRunning" in side_effects) else max(5.0, float(getattr(self.transport.config, "timeout", 10.0)))
+
+        def on_complete(res: Result) -> None:
+            if needs_ack:
+                self._emit(AckEvent(instruction=line, ok=res.ok, message=None if res.ok else res.error))
+
+        return Request(
+            kind=RequestKind.COMMAND,
+            priority=priority,
+            payload=line,
+            timeout_s=timeout_s,
+            expects_ack=needs_ack,
+            side_effects=side_effects,
+            on_complete=on_complete,
+        )
 
     def _run_loop(self) -> None:
         while not self._stop.is_set():
@@ -58,130 +99,7 @@ class Dispatcher:
             except Exception as e:
                 self._emit(ErrorEvent(message=f"apply failed: {e}", context={"instruction": str(instr)}))
 
-            line = str(instr)
-            self._emit(SentEvent(line=line))
-
-            if not self.transport.is_connected():
-                self._emit(ErrorEvent(message="Not connected"))
-                continue
-
-            needs_ack = isinstance(instr, ExpectsAcknowledgement) or isinstance(instr, BlocksExecution)
-            if needs_ack:
-                # Special-case long running M400/G28 with M408 probes
-                try:
-                    dyn_timeout = float(getattr(self.transport.config, "timeout", 10.0))
-                except Exception:
-                    dyn_timeout = 10.0
-                deadline = time.time() + max(2.0, min(30.0, dyn_timeout))
-                upper = line.strip().upper()
-                is_http = (getattr(self.transport.config, "transport_type", "").lower() == "http")
-
-                if upper.startswith("M400") or upper.startswith("G28"):
-                    # Send the command
-                    first = self.transport.query(line)
-                    if first:
-                        self._emit(ReceivedEvent(line=first))
-                    poll_s = 0.5 if is_http else 0.25
-                    got_ack = False
-                    while time.time() < deadline:
-                        try:
-                            status_txt = self.transport.query("M408 S0") or self.transport.query("M408 S2")
-                        except Exception:
-                            status_txt = None
-                        if status_txt:
-                            self._emit(ReceivedEvent(line=status_txt))
-                            txt = status_txt.strip()
-                            is_idle = ('"status":"I"' in txt) or ('\"status\":\"I\"' in txt) or ('\"status\":\"idle\"' in txt)
-                            if is_idle:
-                                self._emit(AckEvent(instruction=line, ok=True, message="Idle"))
-                                got_ack = True
-                                break
-                        time.sleep(poll_s)
-                    if not got_ack:
-                        self._emit(AckEvent(instruction=line, ok=False, message="Ack timeout"))
-                    time.sleep(0.05)
-                    continue
-
-                # Token-based ack for all other gated commands
-                tag = f"AB#{uuid.uuid4().hex[:8]}"
-                try:
-                    # Send main command
-                    first = self.transport.query(line)
-                    if first:
-                        self._emit(ReceivedEvent(line=first))
-                    # Immediately send token via M118 (using semantic class if available)
-                    try:
-                        from semantic_gcode.dict.gcode_commands.M118.M118 import M118_SendMessage
-                        tok_line = str(M118_SendMessage.create(message=tag))
-                    except Exception:
-                        tok_line = f'M118 S"{tag}"'
-                    self._emit(SentEvent(line=tok_line))
-                    _ = self.transport.query(tok_line)
-                    # Log the tag to the session log for correlation
-                    try:
-                        from ..transport.logging_wrapper import log_note
-                        log_note(f"TAG {tag} for {line}")
-                    except Exception:
-                        pass
-                except Exception:
-                    try:
-                        last_err = self.transport.get_last_error()
-                    except Exception:
-                        last_err = None
-                    ctx = {"instruction": line, "tag": tag}
-                    if last_err:
-                        ctx["last_error"] = last_err
-                    self._emit(ErrorEvent(message="Send failed", context=ctx))
-                    time.sleep(0.05)
-                    continue
-
-                got_ack = False
-                base_interval = 0.2 if is_http else 0.05
-                interval = base_interval
-                while time.time() < deadline:
-                    time.sleep(interval)
-                    # Read without sending a command when possible (HTTP)
-                    resp = None
-                    try:
-                        if is_http:
-                            # Try rr_reply first (no command sent)
-                            inner = getattr(self.transport, "transport", None)
-                            try:
-                                resp = inner.read_reply() if hasattr(inner, "read_reply") else None
-                            except Exception:
-                                resp = None
-                        if resp is None:
-                            # As a last resort, do not send empty queries; use a controlled light probe
-                            resp = self.transport.query("M408 S0")
-                    except Exception:
-                        resp = None
-                    if resp:
-                        self._emit(ReceivedEvent(line=resp))
-                        if tag in resp:
-                            self._emit(AckEvent(instruction=line, ok=True, message=tag))
-                            got_ack = True
-                            break
-                        interval = base_interval
-                    else:
-                        interval = min(0.5, interval * 1.5)
-
-                if not got_ack:
-                    self._emit(AckEvent(instruction=line, ok=False, message="Ack timeout"))
-            else:
-                ok = self.transport.send_line(line)
-                if not ok:
-                    try:
-                        last_err = self.transport.get_last_error()
-                    except Exception:
-                        last_err = None
-                    ctx = {"instruction": line}
-                    if last_err:
-                        ctx["last_error"] = last_err
-                    self._emit(ErrorEvent(message="Send failed", context=ctx))
-                    time.sleep(0.05)
-                    continue
-                resp = self.transport.query("")
-                if resp:
-                    self._emit(ReceivedEvent(line=resp))
-
-            time.sleep(0.05) 
+            # Create a Request and submit to the sequencer
+            req = self._to_request(instr)
+            self.sequencer.submit(req)
+            time.sleep(0.01) 

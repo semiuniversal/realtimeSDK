@@ -33,4 +33,14 @@ class ErrorEvent(RuntimeEvent):
 
 @dataclass
 class StateUpdatedEvent(RuntimeEvent):
-    state: Dict[str, Any] = None 
+    state: Dict[str, Any] = None
+
+
+@dataclass
+class UpdatesPausedEvent(RuntimeEvent):
+    reason: Optional[str] = None
+
+
+@dataclass
+class UpdatesResumedEvent(RuntimeEvent):
+    pass 

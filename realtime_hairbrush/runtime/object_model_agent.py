@@ -11,9 +11,9 @@ from realtime_hairbrush.runtime.events import StateUpdatedEvent
 class ObjectModelAgent:
     """
     Minimal async agent to centralize object model updates with coalescing.
-    - Uses M409 for live coords at a short interval during motion
-    - Uses on-demand M408 for snapshots
-    - Emits minimal patches via callback
+    - Uses M409 for live coords at a short interval during motion (serial)
+    - Uses rr_model for targeted status when HTTP available
+    - Emits minimal patches via callback with normalized fields for the UI
     - Wraps sync transport calls using asyncio.to_thread initially
     """
 
@@ -67,6 +67,26 @@ class ObjectModelAgent:
     def request_coords_now(self) -> None:
         self._want_coords.set()
 
+    def _http_available(self) -> bool:
+        try:
+            inner = getattr(self._transport, 'transport', None)
+            # unwrap logging wrapper if present
+            inner2 = getattr(inner, 'transport', inner)
+            return hasattr(inner2, 'get_model') and callable(getattr(inner2, 'get_model'))
+        except Exception:
+            return False
+
+    def _http_get_model(self, key: Optional[str] = None, flags: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        try:
+            inner = getattr(self._transport, 'transport', None)
+            inner2 = getattr(inner, 'transport', inner)
+            getter = getattr(inner2, 'get_model', None)
+            if callable(getter):
+                return getter(key=key, flags=flags)
+        except Exception:
+            return None
+        return None
+
     async def _run(self) -> None:
         # initial snapshot once running
         self._want_snapshot.set()
@@ -101,6 +121,95 @@ class ObjectModelAgent:
     async def _do_snapshot(self) -> None:
         if not self._transport or not self._transport.is_connected():
             return
+        # Prefer rr_model (HTTP) for targeted, fast status
+        if self._http_available():
+            try:
+                # Gather targeted keys (fast + medium)
+                fast_keys = [
+                    ("move.axes[].machinePosition", "f"),
+                    ("state.status", "f"),
+                    ("move.axes[].homed", "f"),
+                    ("state.currentTool", "f"),
+                    ("sensors.endstops[].triggered", "f"),
+                ]
+                medium_keys = [
+                    ("boards[].vIn.current", "f"),
+                    ("boards[].mcuTemp.current", "f"),
+                ]
+                observed: Dict[str, Any] = {"raw_status": {"raw": {}}, "firmware": {}}
+                # Fast keys
+                for key, flags in fast_keys:
+                    data = await asyncio.to_thread(self._http_get_model, key, flags)
+                    if not isinstance(data, dict):
+                        continue
+                    # state.status
+                    if key == "state.status":
+                        st = data.get("result", data.get("state", {}).get("status"))
+                        if st is not None:
+                            observed.setdefault("firmware", {})["status"] = st
+                    # move.axes[].machinePosition
+                    elif key == "move.axes[].machinePosition":
+                        res = data.get("result")
+                        if isinstance(res, list):
+                            observed.setdefault("coords", {})["machine_position"] = res
+                            # Mirror for legacy UI readers
+                            observed.setdefault("raw_status", {}).setdefault("raw", {}).setdefault("coords", {})["machine"] = res
+                    # move.axes[].homed
+                    elif key == "move.axes[].homed":
+                        res = data.get("result")
+                        if isinstance(res, list):
+                            observed.setdefault("homed", {})["axes"] = res
+                            # Mirror for legacy UI readers
+                            observed.setdefault("raw_status", {}).setdefault("raw", {}).setdefault("coords", {})["axesHomed"] = res
+                    # state.currentTool
+                    elif key == "state.currentTool":
+                        res = data.get("result")
+                        if res is not None:
+                            try:
+                                observed["raw_status"]["raw"]["currentTool"] = int(res)
+                            except Exception:
+                                observed["raw_status"]["raw"]["currentTool"] = res
+                    # sensors.endstops[].triggered
+                    elif key.startswith("sensors.endstops"):
+                        res = data.get("result")
+                        ends_map = {}
+                        if isinstance(res, list):
+                            for idx, v in enumerate(res):
+                                try:
+                                    trig = bool(v if isinstance(v, (int, float, bool)) else (v.get("triggered") if isinstance(v, dict) else False))
+                                except Exception:
+                                    trig = False
+                                ends_map[str(idx)] = trig
+                        if ends_map:
+                            observed.setdefault("endstops", {}).update(ends_map)
+                # Medium keys (diagnostics)
+                for key, flags in medium_keys:
+                    data = await asyncio.to_thread(self._http_get_model, key, flags)
+                    if not isinstance(data, dict):
+                        continue
+                    if key == "boards[].vIn.current":
+                        res = data.get("result")
+                        try:
+                            vin_val = float(res[0]) if isinstance(res, list) and res else None
+                        except Exception:
+                            vin_val = None
+                        if vin_val is not None:
+                            observed.setdefault("diagnostics", {})["vin"] = vin_val
+                    elif key == "boards[].mcuTemp.current":
+                        res = data.get("result")
+                        try:
+                            mcu = float(res[0]) if isinstance(res, list) and res else None
+                        except Exception:
+                            mcu = None
+                        if mcu is not None:
+                            observed.setdefault("diagnostics", {})["mcu_temp_c"] = mcu
+                if observed:
+                    self._emit_patch(observed)
+                return
+            except Exception:
+                # Fall back to M408/M409 approach below
+                pass
+        # Fallback legacy snapshot via M408 (serial or HTTP if rr_model not available)
         try:
             # Prefer compact M408 S0 to populate homed[] and quick status
             line0 = "M408 S0"
@@ -171,10 +280,27 @@ class ObjectModelAgent:
         if not self._transport or not self._transport.is_connected():
             return
         start_ts = time.time()
+        # Prefer rr_model for HTTP
+        if self._http_available():
+            try:
+                data = await asyncio.to_thread(self._http_get_model, "move.axes[].machinePosition", "f")
+                if not isinstance(data, dict):
+                    return
+                res = data.get("result")
+                flat = [float(x) for x in res] if isinstance(res, list) else []
+                if len(flat) >= 3:
+                    if self._last_emit and all(abs(flat[i] - self._last_emit[1][i]) < 1e-3 for i in range(3)):
+                        return
+                    self._last_emit = (time.time(), (flat[0], flat[1], flat[2]))
+                    patch = {"coords": {"machine_position": flat}, "raw_status": {"raw": {"coords": {"machine": flat}}}}
+                    self._emit_patch(patch)
+                return
+            except Exception:
+                pass
+        # Serial/path fallback via M409
         try:
             from semantic_gcode.dict.gcode_commands.M409.M409 import M409_QueryObjectModel
-            # Prefer coords.machine; returns {"key":"coords.machine","result":{"coords":{"machine":[...]}}}
-            cmd = M409_QueryObjectModel.create(path='coords.machine', s=2)
+            cmd = M409_QueryObjectModel.create(path='move.axes[].machinePosition', s=2)
             resp = await asyncio.wait_for(asyncio.to_thread(self._transport.query, str(cmd)), timeout=0.8)
             if not resp:
                 return
@@ -183,18 +309,13 @@ class ObjectModelAgent:
             data = cmd.parse_json(resp) or {}
             result = data.get("result")
             flat: list[float] = []
-            # Handle either nested {"coords":{"machine":[...]}} or direct list
-            if isinstance(result, dict):
-                maybe = result.get("coords", {}).get("machine") if isinstance(result.get("coords"), dict) else None
-                if isinstance(maybe, list):
-                    flat = [float(x) for x in maybe if isinstance(x, (int, float))]
-            elif isinstance(result, list):
+            if isinstance(result, list):
                 flat = [float(x) for x in result if isinstance(x, (int, float))]
             if len(flat) >= 3:
                 if self._last_emit and all(abs(flat[i] - self._last_emit[1][i]) < 1e-3 for i in range(3)):
                     return
                 self._last_emit = (time.time(), (flat[0], flat[1], flat[2]))
-                patch = {"coords": {"machine_position": flat}}
+                patch = {"coords": {"machine_position": flat}, "raw_status": {"raw": {"coords": {"machine": flat}}}}
                 self._emit_patch(patch)
         except Exception:
             pass

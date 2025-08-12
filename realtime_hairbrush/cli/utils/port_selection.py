@@ -107,6 +107,58 @@ def is_arduino(port_info: Dict[str, Any]) -> bool:
     return False
 
 
+def _probe_duet_on_port(port: str, baud: int) -> bool:
+    """Probe a single port/baud for a Duet by sending M115 (and fallback M408) and
+    scanning responses for RRF fingerprints within a short window.
+    """
+    try:
+        ser = serial.Serial(port, baudrate=baud, timeout=1.0, write_timeout=1.0)
+        try:
+            # Clear buffers and wake the device
+            try:
+                ser.reset_input_buffer(); ser.reset_output_buffer()
+            except Exception:
+                pass
+            try:
+                ser.dtr = True
+            except Exception:
+                pass
+            ser.write(b"\n"); ser.flush()
+            time.sleep(0.1)
+
+            # First attempt: M115
+            ser.write(b"M115\n"); ser.flush()
+            end = time.time() + 1.8
+            buf = ""
+            while time.time() < end:
+                line = ser.readline().decode(errors='ignore',)
+                if line:
+                    buf += line
+                    low = line.lower()
+                    if ("reprapfirmware" in low) or ("firmware_name" in low) or ("electronics:" in low):
+                        return True
+                    if low.strip() == "ok":
+                        # keep reading a bit more in case info preceded ok
+                        continue
+            # Fallback: try a lightweight object-model query
+            ser.write(b"M408 S0\n"); ser.flush()
+            end = time.time() + 1.2
+            while time.time() < end:
+                line = ser.readline().decode(errors='ignore')
+                if line:
+                    low = line.lower()
+                    if ("\"status\"" in low) or ("rrf" in low) or ("reprapfirmware" in low):
+                        return True
+            return False
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
 def select_port_for_device(device_type: str) -> Optional[str]:
     """
     Auto-select a port for a specific device type using probe-and-parse detection for Duet.
@@ -130,62 +182,11 @@ def select_port_for_device(device_type: str) -> Optional[str]:
     if device_type.lower() in ("duet2", "duet3", "duet"):
         # Try standard baud rates in descending order (highest first)
         baud_rates = [115200, 57600, 38400, 19200, 9600]
-        
-        # Try to import the M115 command class
-        try:
-            from semantic_gcode.dict.gcode_commands.M115.M115 import M115_GetFirmwareInfo
-            m115_cmd = M115_GetFirmwareInfo.create()
-            use_m115_class = True
-        except ImportError:
-            # Fall back to simple string if class not available
-            m115_cmd = "M115"
-            use_m115_class = False
-        
         for port_info in ports:
             port = port_info['device']
-            
             for baud in baud_rates:
-                try:
-                    ser = serial.Serial(port, baudrate=baud, timeout=2)
-                    ser.reset_input_buffer()
-                    time.sleep(0.2)
-                    
-                    # Send M115 to check if it's a Duet board
-                    ser.write(f"{str(m115_cmd)}\n".encode())
-                    ser.flush()
-                    time.sleep(0.3)
-                    
-                    response = ""
-                    for _ in range(3):  # Read a few lines to get the complete response
-                        line = ser.readline().decode(errors='ignore').strip()
-                        if line:
-                            response += line + "\n"
-                    
-                    ser.close()
-                    
-                    # Check if the response indicates a Duet board
-                    resp_lower = response.lower()
-                    if use_m115_class:
-                        try:
-                            info = m115_cmd.parse_info(response)
-                        except Exception:
-                            info = {}
-                        if (
-                            (info.get("firmware_name", "").lower().find("reprapfirmware") != -1)
-                            or ("duet" in info.get("electronics", "").lower())
-                            or ("duet" in resp_lower)
-                            or ("firmware_name" in resp_lower)
-                        ):
-                            return port
-                    else:
-                        if any(s in resp_lower for s in ["reprapfirmware", "duet", "firmware_name"]):
-                            return port
-                        
-                except Exception:
-                    # Just silently continue to the next baud rate or port
-                    pass
-        
-        # If we get here, no Duet board was found
+                if _probe_duet_on_port(port, baud):
+                    return port
         return None
     
     # For Arduino, use legacy logic

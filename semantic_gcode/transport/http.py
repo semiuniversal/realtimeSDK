@@ -242,6 +242,34 @@ class HttpTransport(Transport):
                 return response.text
         except RequestException:
             return None
+
+    def get_model(self, key: Optional[str] = None, flags: Optional[str] = None) -> Dict[str, Any]:
+        """Query rr_model with optional key and flags and return parsed JSON.
+
+        Args:
+            key: Optional object model path (e.g., "sensors.endstops[0:2].triggered")
+            flags: Optional flags string (e.g., "f" or "v")
+
+        Returns:
+            Dict[str, Any]: Parsed JSON response from rr_model
+        """
+        if not self.is_connected():
+            raise ConnectionError("Not connected to Duet Web Control")
+        try:
+            url = f"{self.base_url}/rr_model"
+            params = {}
+            if key:
+                params["key"] = key
+            if flags:
+                params["flags"] = flags
+            response = self._make_request_with_retry('GET', url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                raise TransportError(f"Failed to get rr_model: {response.status_code}")
+            return response.json()
+        except Timeout:
+            raise TimeoutError("Request timed out when getting rr_model")
+        except RequestException as e:
+            raise TransportError(f"Failed to get rr_model: {str(e)}")
     
     def get_status(self) -> Dict[str, Any]:
         """

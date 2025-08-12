@@ -22,8 +22,9 @@ from realtime_hairbrush import __version__
 @click.version_option(version=__version__, prog_name="airbrush")
 @click.option('--config', '-c', help='Path to configuration file')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
+@click.option('--gcode-trace', is_flag=True, help='Enable full G-code tracing (ACTUAL-TX/ACTUAL-RX)')
 @click.pass_context
-def cli(ctx, config, verbose):
+def cli(ctx, config, verbose, gcode_trace):
     """
     Realtime Hairbrush SDK - default launches the TUI.
 
@@ -34,6 +35,9 @@ def cli(ctx, config, verbose):
     ctx.obj['verbose'] = verbose
     ctx.obj['config_file'] = config
     ctx.obj['config_manager'] = ConfigManager(config_file=config)
+    if gcode_trace:
+        # Set env toggle for the process so transports wrap with trace mode
+        os.environ['AIRBRUSH_GCODE_TRACE'] = '1'
 
     if verbose:
         click.echo(f"Realtime Hairbrush SDK v{__version__}")
@@ -362,7 +366,7 @@ def run_standalone_interactive():
                     pass
 
             if runtime_poller is None:
-                runtime_poller = StatusPoller(transport, runtime_state, emit=runtime_dispatcher._emit, interval=0.5)
+                runtime_poller = StatusPoller(runtime_dispatcher.sequencer, runtime_state, emit=runtime_dispatcher._emit, interval_fast=0.25, interval_medium=2.5, interval_slow=25.0)
                 runtime_poller.start()
 
             # Save connection settings for 'last' option
