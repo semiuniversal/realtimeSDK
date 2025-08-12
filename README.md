@@ -90,7 +90,7 @@ Alternative (manual):
 ```bash
 uv run airbrush
 ```
-If `uv` is not successfull installed in your PATH you can still manually launch the app with virtual environment activated via:
+If `uv` is not successfully installed in your PATH you can still manually launch the app with virtual environment activated via:
 ```bash
 airbush
 ```
