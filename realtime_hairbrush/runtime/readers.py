@@ -18,6 +18,7 @@ class StatusPoller:
         interval_fast: float = 0.5,
         interval_medium: float = 2.5,
         interval_slow: float = 25.0,
+        interval_full: float = 5.0,
     ) -> None:
         self.sequencer = sequencer
         self.state = state
@@ -25,11 +26,13 @@ class StatusPoller:
         self.interval_fast = float(interval_fast)
         self.interval_medium = float(interval_medium)
         self.interval_slow = float(interval_slow)
+        self.interval_full = float(interval_full)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_fast: float = 0.0
         self._last_medium: float = 0.0
         self._last_slow: float = 0.0
+        self._last_full: float = 0.0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -153,6 +156,14 @@ class StatusPoller:
             HttpQuerySpec(endpoint="rr_model", params={"key": "boards[].vIn.current", "flags": "f"}),
             HttpQuerySpec(endpoint="rr_model", params={"key": "boards[].mcuTemp.current", "flags": "f"}),
         ]
+        # Periodic full refresh (5s) to keep UI accurate while idle
+        http_full = [
+            HttpQuerySpec(endpoint="rr_model", params={"key": "state.status", "flags": "f"}),
+            HttpQuerySpec(endpoint="rr_model", params={"key": "state.currentTool", "flags": "f"}),
+            HttpQuerySpec(endpoint="rr_model", params={"key": "move.axes[].userPosition", "flags": "f"}),
+            HttpQuerySpec(endpoint="rr_model", params={"key": "move.axes[].homed"}),
+            HttpQuerySpec(endpoint="rr_model", params={"key": "sensors.endstops[].triggered", "flags": "f"}),
+        ]
         serial_fast = [
             SerialQuerySpec('M409 K"move.axes[].userPosition" F"f"'),
             SerialQuerySpec('M409 K"state.status" F"f"'),
@@ -163,6 +174,13 @@ class StatusPoller:
             SerialQuerySpec('M409 K"move.axes[].homed"'),
             SerialQuerySpec('M409 K"boards[].vIn.current" F"f"'),
             SerialQuerySpec('M409 K"boards[].mcuTemp.current" F"f"'),
+        ]
+        serial_full = [
+            SerialQuerySpec('M409 K"state.status" F"f"'),
+            SerialQuerySpec('M409 K"state.currentTool" F"f"'),
+            SerialQuerySpec('M409 K"move.axes[].userPosition" F"f"'),
+            SerialQuerySpec('M409 K"move.axes[].homed"'),
+            SerialQuerySpec('M409 K"sensors.endstops[].triggered" F"f"'),
         ]
         # Detect if HTTP rr_model is available; if not, use serial specs directly
         def http_available() -> bool:
@@ -197,4 +215,12 @@ class StatusPoller:
                     key = spec.params.get("key") if isinstance(spec, HttpQuerySpec) else "medium"
                     self._submit_query(spec, Priority.MEDIUM, coalesce_key=f"medium:{key}")
                 self._last_medium = now
+            # Full refresh (5s)
+            if now - self._last_full >= self.interval_full:
+                specs = http_full if http_available() else serial_full
+                for spec in specs:
+                    key = spec.params.get("key") if isinstance(spec, HttpQuerySpec) else "full"
+                    # Ensure these run even if low/background paused
+                    self._submit_query(spec, Priority.MEDIUM, coalesce_key=f"full:{key}")
+                self._last_full = now
             time.sleep(0.01) 

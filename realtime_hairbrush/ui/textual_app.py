@@ -339,9 +339,11 @@ class AirbrushTextualApp(App):
                 label = getattr(self, "_last_status_label", "?")
         else:
             self._last_status_label = label
-        # Use live machine position for in-flight updates; xyz is the commanded/target position
+        # Prefer work/user position for logical frame, fallback to live machine position
         pos = (
-            obs.get("coords", {}).get("machine_position")
+            obs.get("coords", {}).get("user_position")
+            or obs.get("coords", {}).get("machine_position")
+            or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("userPosition")
             or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("machine")
             or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("xyz")
             or obs.get("raw_status", {}).get("raw", {}).get("position")
@@ -890,16 +892,31 @@ class AirbrushTextualApp(App):
                 return
             if cmd == "paint":
                 # paint <flow 0..1>
-                # Block if not homed
+                # Require XYZ and active flow axis (U for tool 0, V for tool 1) to be homed
                 try:
-                    obs = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed") or []
-                    if not (bool(int(homed[0])) and bool(int(homed[1])) and bool(int(homed[2]))):
+                    raw = self.state.snapshot().get("observed", {}).get("raw_status", {}).get("raw", {})
+                    homed = raw.get("coords", {}).get("axesHomed") or []
+                    def axis_ok(i: int) -> bool:
+                        try:
+                            return bool(int(homed[i]))
+                        except Exception:
+                            return False
+                    x_ok = axis_ok(0)
+                    y_ok = axis_ok(1)
+                    z_ok = axis_ok(2)
+                    tool_idx = raw.get("currentTool")
+                    try:
+                        tool_idx = int(tool_idx) if tool_idx is not None else 0
+                    except Exception:
+                        tool_idx = 0
+                    flow_ok = axis_ok(3) if tool_idx == 0 else axis_ok(4)
+                    if not (x_ok and y_ok and z_ok and flow_ok):
                         if self.high_log:
-                            self.high_log.write("[error] Machine is not homed. Please home first.")
+                            self.high_log.write("[error] Machine is not homed for paint. Please home XYZ and the active flow axis (U for tool 0, V for tool 1).")
                         return
                 except Exception:
                     if self.high_log:
-                        self.high_log.write("[error] Machine is not homed. Please home first.")
+                        self.high_log.write("[error] Machine is not homed for paint. Please home first.")
                     return
                 if not rest:
                     if self.high_log:
