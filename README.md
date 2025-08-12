@@ -40,7 +40,7 @@ A device-independent, real-time control SDK and Textual UI for G-code machines (
 
 ## Overview
 
-This SDK provides a robust, cross-platform Textual (Rich) TUI and a structured semantic G-code layer for building reliable, real-time control applications for G-code machines. It is geared toward an airbrush plotter running RepRapFirmware (Duet), but the abstractions generalize.
+This SDK provides a cross-platform Textual (Rich) TUI as an example app and a structured semantic G-code layer for building real-time control applications for G-code machines. It is geared toward an airbrush plotter running RepRapFirmware (Duet), but the abstractions generalize.
 
 Key features:
 - Cross-platform Textual UI with real-time status and TX/RX logs
@@ -90,6 +90,18 @@ Alternative (manual):
 ```bash
 uv run airbrush
 ```
+If `uv` is not successfull installed in your PATH you can still manually launch the app with virtual environment activated via:
+```bash
+airbush
+```
+
+#### Optional G-gode trace
+If you want to print out all inbound and outbound G-code traffic, launch with the optional parameter `--gcode-trace`
+```bash
+uv run airbrush --gcode-trace
+```
+This will write out extra data to the log file `realtimeSDK/log/airbrush.log`. This file is truncated upon app startup. 
+
 
 ### Connect to Your Device
 
