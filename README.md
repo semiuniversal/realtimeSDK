@@ -14,7 +14,7 @@ A device-independent, real-time control SDK and Textual UI for G-code machines (
 - [Theory of Operation](#theory-of-operation)
   - [Architecture](#architecture)
   - [Event Flow](#event-flow)
-  - [Status Polling (M408 S2)](#status-polling-m408-s2)
+  - [Status Polling](#status-polling)
 - [G-code Paradigm](#g-code-paradigm)
   - [Semantic Command Classes](#semantic-command-classes)
   - [Mixins (Behavior-by-Composition)](#mixins-behavior-by-composition)
@@ -60,12 +60,12 @@ Preferred (activation-free) workflow using uv:
   ```bash
   chmod +x setup.sh
   bash setup.sh
-  uv run airbrush tui-textual
+  uv run airbrush
   ```
 - Windows (PowerShell):
   ```powershell
   ./setup.ps1
-  uv run airbrush tui-textual
+  uv run airbrush
   ```
 
 The setup scripts use `uv sync` to create `.venv` and install dependencies. From then on, use `uv run` to execute commands without activating the virtual environment.
@@ -88,7 +88,7 @@ Alternative (manual):
 ### Launch the TUI
 
 ```bash
-uv run airbrush tui-textual
+uv run airbrush
 ```
 
 ### Connect to Your Device
@@ -133,10 +133,10 @@ Type `help` to list available commands.
 3) StatusPoller issues `M408 S2` on a fixed interval (0.5–1.0s), parses object model, updates MachineState
 4) UI listens to Dispatcher and Poller events and updates panes
 
-### Status Polling (M408 S2)
+### Status Polling
 
-- Uses `coords.machine` for live positions (target `coords.xyz` does not move)
-- M408 JSON is displayed as a single, compact line in the right log
+- Fast tier ~0.5s focuses on minimal object-model keys; UI shows `userPosition` for a consistent logical frame
+- One-shot refreshes run after critical operations (e.g., tool switch realign)
 
 ---
 
@@ -156,9 +156,8 @@ Type `help` to list available commands.
 
 ### Dispatcher and Acknowledgements
 
-- The dispatcher serializes operations
-- Motion sequences typically enqueue `M400` to gate completion
-- UI shows concise, high-level acks (e.g., “Move: OK”)
+- Single in-flight sequencing via dispatcher; commands that require completion enqueue `M400`
+- Logging can be elevated to full G-code trace with `--gcode-trace` (ACTUAL-TX/ACTUAL-RX); rr_model status is suppressed by default
 
 ---
 
@@ -367,7 +366,8 @@ Security notes:
 ### Tool Offsets and T1 Behavior
 
 - `T0` = Brush A (primary), `T1` = Brush B (secondary)
-- `T1` typically relies on firmware `G10` tool offsets; some workflows temporarily disable soft limits (`M564 H0 S0`) for the first offset-applying move and then restore (`M564 H1 S1`). If you automate this, make it explicit and visible in logs.
+- Firmware `G10` offsets are the source of truth; the app switches tools with `Tn` and immediately re-issues a `G1` to the same logical XY to realign physically under the new tool (firmware applies the offset)
+- Soft limits: disable (`M564 H0 S0`) only when switching to Tool 1 if required by travel, and restore (`M564 H1 S1`) when switching back to Tool 0
 
 ### U/V Axis Dead Zone Mapping
 
@@ -378,11 +378,11 @@ Security notes:
 
 ## Troubleshooting
 
-- UI starts but Enter does nothing: ensure you’re using `tui-textual`
-- No status updates: connect first; try `status` to force an M408 S2
-- Excessive logs: keep diagnostics (M122/M119) disabled or run at long intervals
-- Serial bandwidth: 0.5–1.0s polling is realistic; HTTP often tolerates faster polling
-- Defaults flashing: state updates deep-merge; if issues persist, verify M408 parsing
+- UI starts but Enter does nothing: launch with `uv run airbrush`
+- No status updates: connect first; `status` forces a one-shot object-model refresh
+- Excessive logs: avoid enabling full G-code trace continuously; diagnostics (M122/M119) should be disabled or throttled
+- Bandwidth: 0.5s fast polling is typical; slower hardware may need 1–2s
+- Defaults flashing: updates deep-merge; verify object-model keys (prefer `userPosition` for UI)
 
 ---
 

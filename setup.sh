@@ -129,4 +129,10 @@ echo "• Option 2: Runs each command in venv but returns to normal shell"
 echo "• Option 3: Direct execution without activation"
 separator
 
+echo "Suggestion for convenience, if you want to run setup and activate reliably in one command:"
+echo "create a bash alias for running setup and activate:"
+echo " alias setup='./setup.sh && source .venv/bin/activate'"
+
+separator
+
 exit 0
