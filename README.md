@@ -105,7 +105,7 @@ This will write out extra data to the log file `realtimeSDK/log/airbrush.log`. T
 
 ### Connect to Your Device
 
-If you wish to use HTTP, first attach a USB cable for a serial connection. The serial link lets the app discover the machine’s IP address.
+If you wish to use HTTP (_strongy recommended_, it's considerably faster and uses a streamlined status update method), first attach a USB cable for a serial connection. The serial link lets the app discover the machine’s IP address.
 
 - Auto-detect serial (Windows/Duet): `connect serial auto`
 - Specific serial port (examples): `connect serial COM9` (Windows) or `connect serial /dev/ttyACM0` (Linux)
