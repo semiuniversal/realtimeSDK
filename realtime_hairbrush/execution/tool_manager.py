@@ -216,19 +216,29 @@ class ToolManager:
         self.current_tool = tool
         _log_note(f"TOOL current set to {int(tool)}")
         
-    def move_to(self, x: float, y: float, z: Optional[float] = None, 
+    def move_to(self, x: Optional[float] = None, y: Optional[float] = None, z: Optional[float] = None, 
                 feedrate: float = 3000, wait: bool = False) -> None:
         """
         Move to logical coordinates. Firmware G10 offsets handle physical shift per tool.
         """
-        # Update logical position
-        self.logical_position['x'] = x
-        self.logical_position['y'] = y
+        # Update logical position only for provided axes
+        if x is not None:
+            self.logical_position['x'] = x
+        if y is not None:
+            self.logical_position['y'] = y
         if z is not None:
             self.logical_position['z'] = z
         
-        # Send logical coordinates directly
-        g1_cmd = G1_LinearMove.create(x=x, y=y, z=z, feedrate=feedrate)
+        # Send only specified axes so others do not move
+        params: dict = {}
+        if x is not None:
+            params['x'] = x
+        if y is not None:
+            params['y'] = y
+        if z is not None:
+            params['z'] = z
+        params['feedrate'] = feedrate
+        g1_cmd = G1_LinearMove.create(**params)
         self.dispatcher.enqueue(g1_cmd)
         
         if wait:

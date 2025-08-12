@@ -409,7 +409,8 @@ class AirbrushTextualApp(App):
         else:
             conn_label = f"Serial:{host}" if (mode == "serial") else (f"HTTP:{host}" if mode == "http" else "-:-")
         homed_text = "Yes" if homed_flag else "No"
-        line1 = f"Status:{label} | ToolPos[X:{x}] [Y:{y}] [Z:{z}] | Homed:{homed_text}"
+        homed_detail = f"[X:{flag(0)} Y:{flag(1)} Z:{flag(2)} U:{flag(3)} V:{flag(4)}]"
+        line1 = f"Status:{label} | ToolPos[X:{x}] [Y:{y}] [Z:{z}] | Homed:{homed_text} {homed_detail}"
         line2 = f"Tool:{tool_str} | Air:{air_str} | Paint:{paint_str} | Endstops: {ends_list}"
         # Place Not Connected at the start of System line before Vin
         line3 = f"System: [{conn_label}] [Vin {vin} V] [MCU Temp: {mcu_temp} C] [{driver_label}]"
@@ -694,7 +695,7 @@ class AirbrushTextualApp(App):
                 return
             if cmd == "move":
                 # move x.. y.. [z..] [f..]
-                # Block if not homed
+                # Require homing only for the axes being commanded
                 try:
                     obs = self.state.snapshot().get("observed", {})
                     homed = (
@@ -703,20 +704,15 @@ class AirbrushTextualApp(App):
                         or obs.get("raw_status", {}).get("raw", {}).get("homed")
                         or []
                     )
-                    ok = False
-                    if isinstance(homed, (list, tuple)) and len(homed) >= 3:
+                    def axis_ok(i: int) -> bool:
                         try:
-                            ok = bool(int(homed[0])) and bool(int(homed[1])) and bool(int(homed[2]))
+                            return bool(int(homed[i]))
                         except Exception:
-                            ok = False
-                    if not ok:
-                        if self.high_log:
-                            self.high_log.write("[error] Machine is not homed. Please home first.")
-                        return
+                            return False
                 except Exception:
-                    if self.high_log:
-                        self.high_log.write("[error] Machine is not homed. Please home first.")
-                    return
+                    homed = []
+                    def axis_ok(i: int) -> bool:
+                        return False
                 kv = {p[0].lower(): p[1:] for p in rest if len(p) >= 2 and p[0].lower() in ("x","y","z","f") and p[1:].replace('.', '', 1).replace('-', '', 1).isdigit()}
                 x = float(kv['x']) if 'x' in kv else None
                 y = float(kv['y']) if 'y' in kv else None
@@ -725,6 +721,32 @@ class AirbrushTextualApp(App):
                 if x is None and y is None and z is None:
                     if self.high_log:
                         self.high_log.write("[error] move requires at least one of x, y, z")
+                    return
+                # Global homing requirement: all configured motion axes must be homed
+                # Prefer homed list from object model mapping (move.axes[].homed)
+                try:
+                    obs2 = self.state.snapshot().get("observed", {})
+                    homed_list = (
+                        obs2.get("homed", {}).get("axes")
+                        or obs2.get("raw_status", {}).get("raw", {}).get("coords", {}).get("axesHomed")
+                        or []
+                    )
+                except Exception:
+                    homed_list = []
+                all_homed = all(bool(int(v)) for v in homed_list if v is not None)
+                if not all_homed:
+                    # Build axis labels for feedback
+                    labels = ["X","Y","Z","U","V","W"]
+                    not_homed = []
+                    for i, v in enumerate(homed_list):
+                        try:
+                            if not bool(int(v)):
+                                not_homed.append(labels[i] if i < len(labels) else f"A{i}")
+                        except Exception:
+                            not_homed.append(labels[i] if i < len(labels) else f"A{i}")
+                    if self.high_log:
+                        axes_str = ", ".join(not_homed) if not_homed else "unknown"
+                        self.high_log.write(f"[error] Machine is not homed. Please home: {axes_str}.")
                     return
                 # Fill Z from observed if omitted
                 if z is None:
