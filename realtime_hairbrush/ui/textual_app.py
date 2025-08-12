@@ -384,8 +384,44 @@ class AirbrushTextualApp(App):
         except Exception:
             air_on = None
         air_str = "ON" if air_on is True else ("OFF" if air_on is False else "-")
-        paint_flow = self._get_paint_flow()
-        paint_str = (f"{paint_flow:.2f}" if paint_flow is not None else "-")
+        # Paint flow percent display (based on U/V axis mapping if available)
+        paint_str = "-"
+        try:
+            # Try to read current tool and corresponding axis value from observed
+            tool_idx = obs.get("raw_status", {}).get("raw", {}).get("currentTool")
+            tool_idx = int(tool_idx) if tool_idx is not None else 0
+            # Get raw user position list for axes (U is index 3, V is index 4 typically)
+            user_pos = (
+                obs.get("coords", {}).get("user_position")
+                or obs.get("raw_status", {}).get("raw", {}).get("coords", {}).get("userPosition")
+            ) or []
+            uv_val = None
+            if isinstance(user_pos, (list, tuple)):
+                uv_val = user_pos[3] if tool_idx == 0 and len(user_pos) > 3 else (user_pos[4] if tool_idx == 1 and len(user_pos) > 4 else None)
+            # Map mm to percent using configured ranges (defaults: min 0.0, max 4.0, dead zone 0.8)
+            if uv_val is not None:
+                cfg = getattr(self, 'flow_config', None)
+                # If available from ToolManager via state snapshot or known defaults
+                min_mm, max_mm, dead = 0.0, 4.0, 0.8
+                try:
+                    # Try to extract from tool manager if attached
+                    if self.tool_manager:
+                        axis = 'U' if tool_idx == 0 else 'V'
+                        conf = self.tool_manager.flow_config.get(axis, {})
+                        min_mm = float(conf.get('min', min_mm))
+                        max_mm = float(conf.get('max', max_mm))
+                        dead = float(conf.get('dead_zone', dead))
+                except Exception:
+                    pass
+                mm = float(uv_val)
+                if mm <= min_mm:
+                    pct = 0.0
+                else:
+                    usable = max_mm - dead
+                    pct = 0.0 if usable <= 0 else max(0.0, min(1.0, (mm - dead) / usable))
+                paint_str = f"{pct*100:.0f}%"
+        except Exception:
+            paint_str = "-"
         homed = homed_list
         def flag(i):
             try:
