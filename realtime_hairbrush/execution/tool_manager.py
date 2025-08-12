@@ -167,16 +167,12 @@ class ToolManager:
             try:
                 snap = self.state.snapshot().get("observed", {})
                 raw = (snap.get("raw_status", {}) or {}).get("raw", {})
-                # Determine current tool from observed if available
-                obs_tool = raw.get("currentTool")
-                if obs_tool is None:
-                    obs_tool = int(self.current_tool) if self.current_tool is not None else 0
                 # Prefer userPosition when available
                 coords = (raw.get("coords", {}) or {})
                 pos = coords.get("userPosition") or coords.get("machine") or coords.get("xyz") or raw.get("position")
                 if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                    cur_offset = self.tool_offsets[Tool.BRUSH_A if int(obs_tool) == 0 else Tool.BRUSH_B]
-                    # logical = user - current_offset
+                    cur_offset = self.tool_offsets[self.current_tool or Tool.BRUSH_A]
+                    # logical = user - current_internal_offset
                     self.logical_position['x'] = float(pos[0]) - cur_offset.x
                     self.logical_position['y'] = float(pos[1]) - cur_offset.y
                     _log_note(f"TOOL one-time sync logical from observed: user=({pos[0]},{pos[1]}) cur_offset=({cur_offset.x},{cur_offset.y}) -> logical=({self.logical_position['x']},{self.logical_position['y']})")
@@ -186,61 +182,35 @@ class ToolManager:
             finally:
                 self._synced_from_observed_once = True
             
-        if tool == self.current_tool:
-            _log_note("TOOL early return: requested equals current tool")
-            return
-            
-        # Calculate where to move BEFORE tool change so that after T the logical stays the same
-        # With RRF userPosition = machinePosition + offset(tool), the required pre-move is:
-        # C = L0 + (current_offset - target_offset)
-        old_offset = self.tool_offsets[self.current_tool]
-        new_offset = self.tool_offsets[tool]
-        pre_move_x = self.logical_position['x'] + (old_offset.x - new_offset.x)
-        pre_move_y = self.logical_position['y'] + (old_offset.y - new_offset.y)
-        _log_note(f"TOOL pre-move compute: L0=({self.logical_position['x']},{self.logical_position['y']}) old_off=({old_offset.x},{old_offset.y}) new_off=({new_offset.x},{new_offset.y}) -> command C=({pre_move_x},{pre_move_y})")
-
-        # Handle soft limits around pre-move if switching to Tool B (extended range)
+        # Handle soft limits for Tool B
         if tool == Tool.BRUSH_B and not self.soft_limits_disabled:
             m564 = M564_LimitAxes.create(limit_within_bounds=False, require_homing_before_move=False)
             self.dispatcher.enqueue(m564)
             _log_note("TOOL enqueue: M564 S0 H0 (disable limits)")
             self.soft_limits_disabled = True
-        
-        # Pre-move under current tool so that after T we are aligned
-        g1_cmd = G1_LinearMove.create(x=pre_move_x, y=pre_move_y, feedrate=24000)
-        self.dispatcher.enqueue(g1_cmd)
-        _log_note(f"TOOL enqueue: G1 X{pre_move_x} Y{pre_move_y} F24000 (pre-move)")
-        if wait:
-            m400 = M400_WaitForMoves.create()
-            self.dispatcher.enqueue(m400)
-            _log_note("TOOL enqueue: M400 (after pre-move)")
-
-        # Now select the new tool; after this firmware applies the new offset
-        t_cmd = T_SelectTool.create(tool_number=int(tool))
-        self.dispatcher.enqueue(t_cmd)
-        _log_note(f"TOOL enqueue: T{int(tool)}")
-        # Optional small dwell to stabilize object model after T
-        try:
-            from semantic_gcode.dict.gcode_commands.G4.G4 import G4_Dwell
-            self.dispatcher.enqueue(G4_Dwell.create(milliseconds=200))
-            _log_note("TOOL enqueue: G4 P200 (post-T dwell)")
-        except Exception:
-            pass
-        # Normalize user coordinate frame so userPosition reflects logical L0 after T
-        try:
-            from semantic_gcode.dict.gcode_commands.G92.G92 import G92_SetPosition
-            g92 = G92_SetPosition.create(x=self.logical_position['x'], y=self.logical_position['y'])
-            self.dispatcher.enqueue(g92)
-            _log_note(f"TOOL enqueue: G92 X{self.logical_position['x']} Y{self.logical_position['y']} (normalize user coords)")
-        except Exception:
-            _log_note("TOOL note: G92 not available; skipping user coord normalization")
-
-        # If switching back to Tool A, re-enable limits after T
-        if tool == Tool.BRUSH_A and self.soft_limits_disabled:
+        elif tool == Tool.BRUSH_A and self.soft_limits_disabled:
             m564 = M564_LimitAxes.create(limit_within_bounds=True, require_homing_before_move=True)
             self.dispatcher.enqueue(m564)
             _log_note("TOOL enqueue: M564 S1 H1 (enable limits)")
             self.soft_limits_disabled = False
+        
+        # Just switch tools; firmware applies G10 offsets
+        t_cmd = T_SelectTool.create(tool_number=int(tool))
+        self.dispatcher.enqueue(t_cmd)
+        _log_note(f"TOOL enqueue: T{int(tool)} (firmware offset applies)")
+        
+        # After switching tools, move to the same logical XY so the new tool
+        # physically relocates to the prior work position (firmware applies offsets)
+        cur_x = self.logical_position['x']
+        cur_y = self.logical_position['y']
+        g1_same = G1_LinearMove.create(x=cur_x, y=cur_y, feedrate=24000)
+        self.dispatcher.enqueue(g1_same)
+        _log_note(f"TOOL enqueue: G1 X{cur_x} Y{cur_y} F24000 (re-align to logical position)")
+        
+        if wait:
+            m400 = M400_WaitForMoves.create()
+            self.dispatcher.enqueue(m400)
+            _log_note("TOOL enqueue: M400 (post tool switch and realign)")
         
         # Update tracking
         self.current_tool = tool
@@ -249,34 +219,16 @@ class ToolManager:
     def move_to(self, x: float, y: float, z: Optional[float] = None, 
                 feedrate: float = 3000, wait: bool = False) -> None:
         """
-        Move to logical coordinates, automatically applying tool offset.
-        
-        Args:
-            x: Logical X coordinate
-            y: Logical Y coordinate
-            z: Logical Z coordinate (optional)
-            feedrate: Movement speed in mm/min
-            wait: Whether to wait for move to complete
+        Move to logical coordinates. Firmware G10 offsets handle physical shift per tool.
         """
         # Update logical position
         self.logical_position['x'] = x
         self.logical_position['y'] = y
         if z is not None:
             self.logical_position['z'] = z
-            
-        # Calculate physical position with tool offset
-        offset = self.tool_offsets[self.current_tool]
-        physical_x = x + offset.x
-        physical_y = y + offset.y
-        physical_z = self.logical_position['z'] + offset.z if z is not None else None
         
-        # Build and send G1 command
-        g1_cmd = G1_LinearMove.create(
-            x=physical_x,
-            y=physical_y,
-            z=physical_z,
-            feedrate=feedrate
-        )
+        # Send logical coordinates directly
+        g1_cmd = G1_LinearMove.create(x=x, y=y, z=z, feedrate=feedrate)
         self.dispatcher.enqueue(g1_cmd)
         
         if wait:
